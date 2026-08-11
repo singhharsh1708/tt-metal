@@ -1,0 +1,67 @@
+name: "[post-commit] LLK tools - host unit tests"
+
+# Hermetic host-only unit tests for the tt-llk tooling: the llk-audit recall checkers (pure Python)
+# and the sanitizer's lit suite (clang -verify and split-file). Neither needs hardware or a repo
+# build, and both finish in seconds, so they share one runner. Path-filtered so they only run when
+# the tools they cover change.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    branches:
+      - "main"
+    paths:
+      - "tt_metal/tt-llk/.claude/tools/llk-audit/**"
+      - "tt_metal/tt-llk/tools/**"
+      - ".github/workflows/llk-tool-tests.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  llk-tool-unit-tests:
+    name: Run LLK host tool unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        timeout-minutes: 10
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Run llk-audit checker unit tests
+        working-directory: tt_metal/tt-llk/.claude/tools/llk-audit
+        run: python3 tests/test_checks.py
+
+      # split-file lives in llvm-<n>-tools, not in llvm itself, and libfmt backs the report mocks.
+      # The version is read off the runner's own clang so an image bump cannot strand this pin.
+      - name: Install sanitizer lit-suite toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libfmt-dev
+          version_out="$(clang++ --version)"
+          [[ "${version_out}" =~ version\ ([0-9]+) ]] || { echo "::error::cannot parse clang version"; exit 1; }
+          llvm_ver="${BASH_REMATCH[1]}"
+          echo "clang major version: ${llvm_ver}"
+          sudo apt-get install -y --no-install-recommends "llvm-${llvm_ver}-tools"
+          echo "LLVM_BIN=/usr/lib/llvm-${llvm_ver}/bin" >> "$GITHUB_ENV"
+          python3 -m pip install --upgrade lit
+
+      # lit exits 0 on UNSUPPORTED, so an unusable libfmt would otherwise land as a green run with
+      # only three of the seven cases actually compiled. Treat a skip as a failure instead.
+      - name: Run sanitizer lit suite
+        working-directory: tt_metal/tt-llk
+        run: |
+          set -euo pipefail
+          test -x "${LLVM_BIN}/split-file" || { echo "::error::split-file not found in ${LLVM_BIN}"; exit 1; }
+          lit -v tools/tests/unit 2>&1 | tee "${RUNNER_TEMP}/lit.log"
+          if grep -qE '^(UNSUPPORTED|UNRESOLVED):' "${RUNNER_TEMP}/lit.log"; then
+            echo "::error::every case must run in CI; a skipped one means a missing dependency"
+            grep -E '^(UNSUPPORTED|UNRESOLVED):' "${RUNNER_TEMP}/lit.log"
+            exit 1
+          fi
