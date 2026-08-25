@@ -61,10 +61,20 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
 
     // Populate the RM-only locals (chunk sizes, page bytes, padding identity, datum sizes) into
     // a single struct so the per-site formulas don't drift between this factory and the W one.
-    // tt::datum_size(...) inside make_rm_plan throws for block-float formats; guard the call
-    // behind rm_path since validate_rm_preconditions already gates the RM branch to BF16/FP32.
+    // tt::datum_size(...) inside make_rm_plan throws for block-float formats, so only populate it on
+    // paths already gated to BF16/FP32: validate_rm_preconditions for the RM path, and the
+    // tile_h_split fatals in validate_on_program_cache_miss for the TILE H-axis split below.
+    //
+    // TILE H-axis split: the tiled reader and reduce.cpp over `num_h_slices` slices, but ROW_MAJOR
+    // partials written by the RM writer (one row per slice), so it needs the plan too.
+    // use_width_sharding is excluded here and not only on the host: the sharded branch below
+    // reassigns all_cores and the per-core column counts *after* num_cols is computed, and its
+    // runtime args ignore slices entirely, so a direct ttnn::prim::reduce call must not be able to
+    // reach that combination.
+    const bool tile_h_split = !rm_path && !use_width_sharding && operation_attributes.num_h_slices > 1;
+
     RmPlan plan{};
-    if (rm_path) {
+    if (rm_path || tile_h_split) {
         plan = make_rm_plan(
             shape,
             logical_shape,
@@ -77,16 +87,22 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
     }
 
     // H-axis split geometry: every slice reduces a uniform `slice_Ht` tiles, the last one's overhang
-    // past Ht_rm identity-padded by the reader. Clamped to Ht_rm so no slice is empty.
-    const uint32_t num_h_slices = rm_path ? std::min(std::max(operation_attributes.num_h_slices, 1u), plan.Ht_rm) : 1;
-    const uint32_t slice_Ht = rm_path ? tt::div_up(plan.Ht_rm, num_h_slices) : 0;
+    // past the end of the reduction axis identity-padded by the reader. The RM path counts H tiles
+    // from the logical H (plan.Ht_rm); the tiled path from the padded H (Ht), matching the tile ids
+    // its reader indexes. Clamped so no slice is empty.
+    const uint32_t Ht_for_split = rm_path ? plan.Ht_rm : Ht;
+    const uint32_t num_h_slices =
+        (rm_path || tile_h_split) ? std::min(std::max(operation_attributes.num_h_slices, 1u), Ht_for_split) : 1;
+    const uint32_t slice_Ht =
+        rm_path ? tt::div_up(plan.Ht_rm, num_h_slices) : (tile_h_split ? tt::div_up(Ht, num_h_slices) : 0);
     // compute_output_specs sizes the output's H from the unclamped attribute, so the clamp above must
-    // be a no-op; the host already bounds num_h_slices by Ht_rm.
+    // be a no-op; the host already bounds num_h_slices by the H tile count.
     TT_FATAL(
-        !rm_path || operation_attributes.num_h_slices <= plan.Ht_rm,
-        "Reduce H (dense RM): num_h_slices {} exceeds Ht_rm {}; the output spec and the kernels would disagree",
+        !(rm_path || tile_h_split) || operation_attributes.num_h_slices <= Ht_for_split,
+        "Reduce H: num_h_slices {} exceeds the reduction-axis tile count {}; the output spec and the "
+        "kernels would disagree",
         operation_attributes.num_h_slices,
-        plan.Ht_rm);
+        Ht_for_split);
 
     uint32_t chunk_size = use_width_sharding ? 1 : ttnn::get_dest_reg_count(operation_attributes.compute_kernel_config);
 
@@ -415,8 +431,17 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
         reader_desc.compile_time_args = reader_compile_time_args;
         reader_desc.defines = {reader_defines.begin(), reader_defines.end()};
     } else {
+        // Slots 6-7 are the H-axis-split geometry; {1, Ht} is the un-split reduce, which the reader
+        // handles with its original incremental tile walk.
         std::vector<uint32_t> reader_compile_time_args = {
-            Ht, Wt, HtWt, scaler_bits, /*use_welford=*/0, fp32_sfpu_reduce ? 1u : 0u};
+            Ht,
+            Wt,
+            HtWt,
+            scaler_bits,
+            /*use_welford=*/0,
+            fp32_sfpu_reduce ? 1u : 0u,
+            tile_h_split ? num_h_slices : 1u,
+            tile_h_split ? slice_Ht : Ht};
         TensorAccessorArgs(a).append_to(reader_compile_time_args);
 
         // Pass DEST config so reader can compute DEST_AUTO_LIMIT
@@ -437,8 +462,9 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
     writer_desc.core_ranges = all_cores;
     writer_desc.config = WriterConfigDescriptor{};
 
-    if (rm_path) {
+    if (rm_path || tile_h_split) {
         // One writer for both layouts; tile_output picks whole-tile pages over (nc, slice) RM pages.
+        // The TILE split always emits ROW_MAJOR partials, so tile_output is false there.
         std::vector<uint32_t> writer_compile_time_args = build_rm_writer_ct_args(
             plan, output, ReduceOpDim::H, operation_attributes.output_layout == Layout::TILE, num_h_slices);
 
@@ -475,11 +501,11 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
         compute_kernel_args_group_1 = build_rm_compute_ct_args(plan, slice_Ht, post_mul_scaler_bits, fp32_sfpu_reduce);
     } else {
         compute_kernel_args_group_1 = {
-            Ht,                          // Ht
-            compute_Wt,                  // Wt
-            compute_NC,                  // NC
-            post_mul_scaler_bits,        // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
-            fp32_sfpu_reduce ? 1u : 0u,  // enable_fp32_sfpu: route Float32 through the SFPU
+            tile_h_split ? slice_Ht : Ht,  // Ht (per-slice under the H-axis split)
+            compute_Wt,                    // Wt
+            compute_NC,                    // NC
+            post_mul_scaler_bits,          // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
+            fp32_sfpu_reduce ? 1u : 0u,    // enable_fp32_sfpu: route Float32 through the SFPU
         };
     }
 
@@ -514,11 +540,11 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
                 use_width_sharding ? (num_cols_per_core_group_2 / NC) : num_cols_per_core_group_2;
             uint32_t compute_NC_group_2 = use_width_sharding ? NC : 1;
             compute_kernel_args_group_2 = {
-                Ht,                          // Ht
-                compute_Wt_group_2,          // Wt
-                compute_NC_group_2,          // NC
-                post_mul_scaler_bits,        // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
-                fp32_sfpu_reduce ? 1u : 0u,  // enable_fp32_sfpu: route Float32 through the SFPU
+                tile_h_split ? slice_Ht : Ht,  // Ht (per-slice under the H-axis split)
+                compute_Wt_group_2,            // Wt
+                compute_NC_group_2,            // NC
+                post_mul_scaler_bits,          // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
+                fp32_sfpu_reduce ? 1u : 0u,    // enable_fp32_sfpu: route Float32 through the SFPU
             };
         }
 
@@ -627,8 +653,15 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
             } else {
                 TT_THROW("Core not in specified core ranges");
             }
-            reader_desc.emplace_runtime_args(
-                core, {a, (num_cols_read / Wt * HtWt) + (num_cols_read % Wt), num_cols_read % Wt, num_cols_per_core});
+            if (tile_h_split) {
+                // The split reader decomposes (nc, slice, wt) from the global work-unit id itself,
+                // so slot 1 carries that id and slot 2 (curr_col_in_batch) is unused.
+                reader_desc.emplace_runtime_args(core, {a, num_cols_read, 0u, num_cols_per_core});
+            } else {
+                reader_desc.emplace_runtime_args(
+                    core,
+                    {a, (num_cols_read / Wt * HtWt) + (num_cols_read % Wt), num_cols_read % Wt, num_cols_per_core});
+            }
 
             writer_desc.emplace_runtime_args(
                 core,

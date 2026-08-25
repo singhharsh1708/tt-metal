@@ -324,7 +324,14 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
         // enable_fp32_sfpu=0: Welford never uses the fp32-SFPU reduce path (use_welford=1 forces
         // row_chunk=1). The slot keeps this reader's CT-arg layout in lockstep with the reduce factories.
         std::vector<uint32_t> reader_compile_time_args = {
-            Ht, Wt, HtWt, scaler_bits, /*use_welford=*/1, /*enable_fp32_sfpu=*/0u};
+            Ht,
+            Wt,
+            HtWt,
+            scaler_bits,
+            /*use_welford=*/1,
+            /*enable_fp32_sfpu=*/0u,
+            /*num_h_slices=*/1u,
+            /*slice_Ht=*/Ht};
         TensorAccessorArgs(input).append_to(reader_compile_time_args);
         reader_desc.kernel_source =
             "ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/"
