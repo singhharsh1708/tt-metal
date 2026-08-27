@@ -16,6 +16,7 @@ import ttnn
 from models.demos.deepseek_v3_d_p.tt.dflash_prefill.dflash_drafter_config import DFlashDrafterConfig
 from models.demos.deepseek_v3_d_p.tt.dflash_prefill.tt_dflash_drafter import TtDFlashDrafter
 from models.demos.deepseek_v3_d_p.tt.dflash_prefill.utils import load_drafter_state_dict
+from models.demos.deepseek_v3_d_p.tt.mla.rope import ChunkMetadata, refresh_llama4_scale
 from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_gate_prefill import GateComputeMode
 from models.demos.deepseek_v3_d_p.tt.moe.tt_routed_expert import DEFAULT_ROUTED_EXPERT_WEIGHTS_DTYPE
 from models.demos.deepseek_v3_d_p.tt.runners.input_prep import prepare_prefill_input_tensor
@@ -567,7 +568,14 @@ class TtPrefillRuntime:
         # non-first rank make_chunk_input yields a placeholder hidden-state activation (the D2D-received one).
         self._trace_input = self.make_chunk_input([0] * chunk)
         # Per-element metadata: (slot_id, actual_start, actual_end), seeded for chunk 0.
-        self._trace_metadata = (self._meta1_dev(0), self._meta1_dev(0), self._meta1_dev(chunk))
+        # ChunkMetadata, not a bare tuple: Mistral needs a 4th field (the llama4 query-scale buffer)
+        # whose lifetime matches these scalars. None elsewhere, and fields 0-2 are unchanged.
+        self._trace_metadata = ChunkMetadata(
+            self._meta1_dev(0),
+            self._meta1_dev(0),
+            self._meta1_dev(chunk),
+            self.model.rope_setup.make_llama4_scale_buffer(chunk),
+        )
         # Same three words packed, for the D2H ack record. Allocated whether or not the ack is wired:
         # set_d2h_ack_service() runs after compile(), and the capture needs an address that predates it.
         self._trace_metadata_msg = self._meta3_dev((0, 0, chunk))
@@ -686,6 +694,28 @@ class TtPrefillRuntime:
             )
             ttnn.copy(input_tensor, self._trace_input)
             self._metadata_from_msg(metadata_msg)
+            # The three scalars come from the packed message on-device, with no host round trip. The
+            # llama4 query-scale buffer cannot: llama4_scale_host() computes it on the host from
+            # actual_start, so it still needs that as a Python int.
+            #
+            # A stale scale is SILENT -- the buffer is initialised to ones, so a missed refresh applies
+            # no temperature rather than failing, and the chunked PCC gate cannot see the difference
+            # (~0.002 against a 0.98 threshold). So a model that needs the scale must never reach the
+            # replay without one; refuse instead of running quietly wrong.
+            if self._trace_metadata.llama4_scale is not None:
+                assert actual_start is not None, (
+                    "use_trace: this model applies the llama4 query temperature, which is computed on "
+                    "the host from actual_start, but the traced path was given only metadata_msg. Pass "
+                    "actual_start, or compute the scale on-device from the metadata words."
+                )
+                refresh_llama4_scale(
+                    self._trace_metadata.llama4_scale,
+                    self.hf_config,
+                    self.mesh_device,
+                    actual_start,
+                    self.config.chunk_size,
+                    sp_axis=self.config.sp_axis,
+                )
             self._controller.replay()
             ttnn.deallocate(input_tensor)
             # Non-last rank: return the persistent output activation (replay just refreshed it) for the
