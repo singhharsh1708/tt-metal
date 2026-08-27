@@ -27,6 +27,21 @@ from models.tt_transformers.tt.model_config import determine_device_name
 # (padded_batch × padded_prefill_seq_len).
 GEMMA4_MAX_BATCHED_PREFILL_SEQ_LEN = MAX_BATCHED_PREFILL_SEQ_LEN
 
+# Gemma4Generator (demo) and Gemma4ForCausalLM (vLLM bridge) sit on separate
+# branches of the Generator hierarchy, so the capabilities they declare have to
+# be shared explicitly rather than inherited. They describe the model, not the
+# bridge, so both classes declare the same set even where only one has a reader.
+GEMMA4_MODEL_CAPABILITIES = {
+    "supports_prefix_caching": False,
+    "supports_async_decode": False,
+    # Gemma4ModelArgs exposes no get_attn_sdpa_program_config, so the resume
+    # offset alignment cannot be derived. chunked_prefill_sdpa pins
+    # q_chunk_size=128 and documents that its base_offset must be a multiple
+    # of it.
+    "resumed_prefill_token_alignment": 128,
+    "supports_sample_on_device": True,
+}
+
 
 def _load_text_tokenizer(model_path):
     # The 12B tokenizer config can advertise multimodal extra_special_tokens as
@@ -283,15 +298,7 @@ class ChunkedPrefillPageTableGuardMixin:
 
 
 class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
-    model_capabilities = {
-        "supports_prefix_caching": False,
-        "supports_async_decode": False,
-        # Gemma4ModelArgs exposes no get_attn_sdpa_program_config, so the resume
-        # offset alignment cannot be derived. chunked_prefill_sdpa pins
-        # q_chunk_size=128 and documents that its base_offset must be a multiple
-        # of it.
-        "resumed_prefill_token_alignment": 128,
-    }
+    model_capabilities = GEMMA4_MODEL_CAPABILITIES
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

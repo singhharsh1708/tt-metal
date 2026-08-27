@@ -8,7 +8,7 @@ from loguru import logger
 
 import ttnn
 from models.demos.gemma4.tt.common import create_tt_model
-from models.demos.gemma4.tt.generator import ChunkedPrefillPageTableGuardMixin
+from models.demos.gemma4.tt.generator import GEMMA4_MODEL_CAPABILITIES, ChunkedPrefillPageTableGuardMixin
 from models.demos.gemma4.tt.generator_trace import (
     maybe_disable_pli_prefill_trace,
     patch_gemma4_trace_model_args,
@@ -113,16 +113,7 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
     ttnn_decode_forward}`` (mirrors the gpt-oss bridge).
     """
 
-    model_capabilities = {
-        "supports_prefix_caching": False,
-        "supports_async_decode": False,
-        # Gemma4ModelArgs exposes no get_attn_sdpa_program_config, so the resume
-        # offset alignment cannot be derived. chunked_prefill_sdpa pins
-        # q_chunk_size=128 and documents that its base_offset must be a multiple
-        # of it.
-        "resumed_prefill_token_alignment": 128,
-        "supports_sample_on_device": True,
-    }
+    model_capabilities = GEMMA4_MODEL_CAPABILITIES
 
     # Hybrid vLLM kv-cache groups: env-gated via ``GEMMA4_HYBRID_KV_CACHE_GROUPS``
     # (default OFF). Toggle from the tt-inference-server model-spec env so the KV
