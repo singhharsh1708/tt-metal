@@ -40,6 +40,7 @@ GEMMA4_MODEL_CAPABILITIES = {
     # of it.
     "resumed_prefill_token_alignment": 128,
     "supports_sample_on_device": True,
+    "supports_chunked_prefill": True,
 }
 
 
