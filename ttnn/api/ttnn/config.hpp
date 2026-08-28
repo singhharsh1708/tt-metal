@@ -35,6 +35,8 @@ namespace core {
 // snapshots this control on first dispatch.
 MatmulRegistryMode get_matmul_registry_mode() noexcept;
 void set_matmul_registry_mode(MatmulRegistryMode mode) noexcept;
+MatmulRegistryMode get_agmm_registry_mode() noexcept;
+void set_agmm_registry_mode(MatmulRegistryMode mode) noexcept;
 
 struct Config {
     struct attributes_t {
@@ -82,9 +84,13 @@ public:
     }
 
     template <reflect::fixed_string name>
-        requires(std::string_view{name} == "matmul_registry_mode")
+        requires(std::string_view{name} == "matmul_registry_mode" || std::string_view{name} == "agmm_registry_mode")
     MatmulRegistryMode get() const noexcept {
-        return get_matmul_registry_mode();
+        if constexpr (std::string_view{name} == "matmul_registry_mode") {
+            return get_matmul_registry_mode();
+        } else {
+            return get_agmm_registry_mode();
+        }
     }
 
     template <reflect::fixed_string name>
@@ -108,9 +114,13 @@ public:
     }
 
     template <reflect::fixed_string name>
-        requires(std::string_view{name} == "matmul_registry_mode")
+        requires(std::string_view{name} == "matmul_registry_mode" || std::string_view{name} == "agmm_registry_mode")
     void set(const MatmulRegistryMode mode) noexcept {
-        set_matmul_registry_mode(mode);
+        if constexpr (std::string_view{name} == "matmul_registry_mode") {
+            set_matmul_registry_mode(mode);
+        } else {
+            set_agmm_registry_mode(mode);
+        }
     }
 
     // Defined in config.cpp (uses tt-logger).
