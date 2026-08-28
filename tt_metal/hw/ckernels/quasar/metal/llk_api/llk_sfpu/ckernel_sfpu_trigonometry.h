@@ -255,7 +255,10 @@ inline void calculate_cosine() {
     const float P0 = -0x1.92p+0f;   // representable as bf16
     const float P1 = -0x1.fbp-12f;  // representable as fp16
 
-    sfpi::vFloat C3, C2, C1, C0;
+    sfpi::vFloat C2, C1, C0;
+    float C3;  // Cannot keep this in a register in 7.73.0, which
+               // removes -1,of constant.  After sfpi 7.73.0
+               // lands we'll have vConstFloatPrgm3 to hold it
 
     if constexpr (is_fp32_dest_acc_en) {
         // Constants for sin(a) = a + a^3 (C0 + a^2 (C1 + a^2 (C2 + a^2 C3))) on [0, PI/2].
@@ -268,6 +271,7 @@ inline void calculate_cosine() {
         C1 = 0x1.10c2a2p-7f;
         C0 = -0x1.5554a4p-3f;
     }
+    sfpi::vFloat C3 = sfpi::vConstFloatPrgm3;
 
     const float ROUNDING_BIAS = 12582912.0f;
     const float NEG_ROUNDING_BIAS = -12582912.0f;
