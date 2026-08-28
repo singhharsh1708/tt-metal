@@ -257,26 +257,23 @@ def test_checked_in_registry_snapshot_is_fresh() -> None:
     assert (CHECKED_IN_GENERATED_DIR / "matmul_registry_data.cpp").read_bytes() == expected_source
 
 
-def test_optional_compatibility_manifest_is_strict_and_emitted(expect_error) -> None:
+def test_semantic_source_is_emitted_as_inert_provenance() -> None:
+    checked = emitter.validate_lock(direct_lock())
+    _, source = emitter.emit(checked)
+    assert b".semantic_source_sha256 = {{0x11, 0x11" in source
+    assert b"compatibility" not in source
+    assert b"build_identity" not in source
+    assert b"runtime_capability" not in source
+
+
+def test_compatibility_manifest_is_no_longer_an_accepted_lock_field(expect_error) -> None:
     lock = direct_lock()
     lock["compatibility"] = {
         "build_identity_sha256": "2" * 64,
         "runtime_capability_sha256": "3" * 64,
         "schema_version": 1,
     }
-    checked = emitter.validate_lock(_seal(lock))
-    _, source = emitter.emit(checked)
-    assert b".compatibility_schema_version = 1" in source
-    assert b"0x22, 0x22" in source
-    assert b"0x33, 0x33" in source
-
-    lock = direct_lock()
-    lock["compatibility"] = {
-        "build_identity_sha256": ZERO,
-        "runtime_capability_sha256": "3" * 64,
-        "schema_version": 1,
-    }
-    with expect_error(emitter.LockValidationError, "must be nonzero"):
+    with expect_error(emitter.LockValidationError, "field mismatch"):
         emitter.validate_lock(_seal(lock))
 
 

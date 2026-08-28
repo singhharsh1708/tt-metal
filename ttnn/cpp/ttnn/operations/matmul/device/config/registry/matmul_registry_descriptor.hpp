@@ -108,13 +108,13 @@ struct TableMetadata {
     // Nonzero only when exact evidence explicitly authorizes eligibility-
     // proven linear/addmm aliases to the dense matmul kernel key.
     std::uint16_t matmul_kernel_equivalence_schema_version{};
-    // Zero keeps the table fail-closed until promotion supplies independently
-    // measured expected build and runtime-capability identities.
-    std::uint16_t compatibility_schema_version{};
+    // The lock's own integrity digest. The runtime requires it nonzero before
+    // serving the table.
     Sha256 content_sha256{};
+    // Inert provenance only: the matmul source identity measured when the lock
+    // was promoted. It is emitted so a table's origin is readable in a diff and
+    // in telemetry, and is never compared against the running build.
     Sha256 semantic_source_sha256{};
-    Sha256 build_identity_sha256{};
-    Sha256 runtime_capability_sha256{};
 };
 
 }  // namespace ttnn::operations::matmul::registry::compact
