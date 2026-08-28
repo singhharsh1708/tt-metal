@@ -43,6 +43,10 @@
       timeout: 50
     bh_p150b_civ2:
       timeout: 50
+    wh_n150:
+      timeout: 50
+    bh_p150:
+      timeout: 50
   owner_id: U084B1CES7M # Borys Bradel
   team: ttnn
   category: matmul
@@ -58,6 +62,10 @@
       timeout: 65
     bh_p150b_civ2:
       timeout: 65
+    wh_n150:
+      timeout: 65
+    bh_p150:
+      timeout: 65
   owner_id: U084B1CES7M # Borys Bradel
   team: ttnn
   category: fused
@@ -72,6 +80,10 @@
     bh_p100:
       timeout: 45
     bh_p150b_civ2:
+      timeout: 45
+    wh_n150:
+      timeout: 45
+    bh_p150:
       timeout: 45
   owner_id: U084B1CES7M # Borys Bradel
   team: ttnn
@@ -219,6 +231,10 @@
     bh_p100:
       timeout: 45
     bh_p150b_civ2:
+      timeout: 45
+    wh_n150:
+      timeout: 45
+    bh_p150:
       timeout: 45
   owner_id: U084B1CES7M # Borys Bradel
   team: ttnn
