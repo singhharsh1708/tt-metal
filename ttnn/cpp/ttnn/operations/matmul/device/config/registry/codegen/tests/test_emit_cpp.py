@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import collections
 import copy
+import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -251,10 +254,179 @@ def test_direct_lock_emits_deterministically_and_cli_is_reproducible(tmp_path: P
     assert (tmp_path / "generated.cpp").read_bytes() == first[1]
 
 
-def test_checked_in_registry_snapshot_is_fresh() -> None:
-    expected_header, expected_source = emitter.emit(emitter.load_lock(CHECKED_IN_LOCK_PATH))
-    assert (CHECKED_IN_GENERATED_DIR / "matmul_registry_data.hpp").read_bytes() == expected_header
-    assert (CHECKED_IN_GENERATED_DIR / "matmul_registry_data.cpp").read_bytes() == expected_source
+# --- checked-in table freshness -------------------------------------------
+#
+# The shipped table is no longer emitted from matmul_registry.lock.json. It is
+# emitted directly by the offline consolidating builder
+# (`tt-matmul-build-big-registry`), whose selection policy is recorded in the
+# table's own header banner. The lock could not be regenerated for it: the lock
+# schema binds every entry to per-entry `bank_evidence` digests and a single
+# `bank_artifact_sha256` under `deterministic-matmul-bank-v2`, and the new
+# builder consumes measurement bundles rather than that bank. Emitting a lock
+# for this table would mean inventing those attestation values, so the lock is
+# retained below only as the historical record of the previous table.
+#
+# The freshness guard therefore checks what is checkable in-tree: the shipped
+# table must still hash to the `content_sha256` it serves to the runtime. The
+# digest is taken over the builder's canonical entry spelling, so the table is
+# parsed back into that spelling and re-hashed. Any hand-edit to any entry
+# field, or any table swapped in without its matching digest, fails here.
+
+_ENTRY_BYTES_RE = re.compile(r"\{\{((?:0x[0-9a-f]{2}(?:,\s*)?)+)\}\}")
+_TENSOR_RE = re.compile(
+    r"compact::TensorDescriptor\{\.buffer_type = compact::BufferType::(\w+), "
+    r"\.dtype = compact::DataType::(\w+), \.layout = compact::Layout::(\w+), "
+    r"\.memory_layout = compact::MemoryLayout::(\w+), \.tile_height = (\d+), \.tile_width = (\d+)\}"
+)
+_TOPOLOGY_RE = re.compile(r"\.topology_sha256 = \{\{[^}]*\}\},")
+
+_CPP_TO_JSON = {
+    "BufferType": {"Dram": "dram", "L1": "l1"},
+    "DataType": {"BFloat16": "bfloat16", "BFloat8B": "bfloat8_b", "Float32": "float32", "BFloat4B": "bfloat4_b"},
+    "Layout": {"RowMajor": "row_major", "Tile": "tile"},
+    "MemoryLayout": {"Interleaved": "interleaved"},
+    "Domain": {"DenseMatmul": "dense.matmul", "DenseLinear": "dense.linear", "DenseAddmm": "dense.addmm"},
+    "ProgramFamily": {
+        "MultiCoreReuse": "multi_core_reuse",
+        "MultiCast1D": "multi_cast_1d",
+        "MultiCast2D": "multi_cast_2d",
+    },
+    "MathFidelity": {"LoFi": "lofi", "HiFi2": "hifi2", "HiFi3": "hifi3", "HiFi4": "hifi4"},
+    "ThrottleLevel": {
+        "NoThrottle": "no_throttle",
+        "Throttle1": "throttle_1",
+        "Throttle2": "throttle_2",
+        "Throttle3": "throttle_3",
+        "Throttle4": "throttle_4",
+        "Throttle5": "throttle_5",
+    },
+}
+
+
+def _hex_from_byte_literal(literal: str) -> str:
+    return "".join(byte.strip()[2:] for byte in literal.split(","))
+
+
+def _enum_value(kind: str, text: str, field: str) -> str:
+    spelling = re.search(rf"\.{field} = compact::{kind}::(\w+)", text).group(1)
+    return _CPP_TO_JSON[kind][spelling]
+
+
+def _scalar_fields(text: str) -> dict:
+    fields: dict = {}
+    for name, value in re.findall(r"\.(\w+) = (true|false|\d+)(?:ULL|u)?\s*[,}]", text):
+        fields[name] = True if value == "true" else False if value == "false" else int(value)
+    return fields
+
+
+def _tensor_fields(match: re.Match) -> dict:
+    return {
+        "buffer_type": _CPP_TO_JSON["BufferType"][match.group(1)],
+        "dtype": _CPP_TO_JSON["DataType"][match.group(2)],
+        "layout": _CPP_TO_JSON["Layout"][match.group(3)],
+        "memory_layout": _CPP_TO_JSON["MemoryLayout"][match.group(4)],
+        "tile_height": int(match.group(5)),
+        "tile_width": int(match.group(6)),
+    }
+
+
+def parse_checked_in_entries(source: str) -> list[dict]:
+    """Recover the builder's canonical entry spelling from the emitted table."""
+
+    body = source.split("kProgramConfigExactEntries{{", 1)[1]
+    entries = []
+    for block in body.split("compact::ProgramConfigExactEntry{")[1:]:
+        key_text = block.split(".key = compact::KeyDescriptor{", 1)[1].split(".program_config =", 1)[0]
+        program_text = block.split(".program_config = compact::ProgramConfigDescriptor{", 1)[1].split(
+            ".compute_kernel_config =", 1
+        )[0]
+        compute_text = block.split(".compute_kernel_config = compact::ComputeKernelDescriptor{", 1)[1]
+
+        entry_id = _hex_from_byte_literal(_ENTRY_BYTES_RE.search(block.split(".key =", 1)[0]).group(1))
+        tensors = list(_TENSOR_RE.finditer(key_text))
+        assert len(tensors) == 3, f"expected input_a, input_b and output, got {len(tensors)}"
+        input_a, input_b, output = (_tensor_fields(tensor) for tensor in tensors)
+        topology = _hex_from_byte_literal(_ENTRY_BYTES_RE.search(_TENSOR_RE.sub("", key_text)).group(1))
+
+        key = _scalar_fields(_TOPOLOGY_RE.sub("", _TENSOR_RE.sub("", key_text)))
+        key.update(
+            {
+                "input_a": input_a,
+                "input_b": input_b,
+                "output": output,
+                "topology_sha256": topology,
+                "domain": _enum_value("Domain", key_text, "domain"),
+            }
+        )
+        program_config = _scalar_fields(program_text)
+        program_config["family"] = _enum_value("ProgramFamily", program_text, "family")
+        compute_kernel_config = _scalar_fields(compute_text)
+        compute_kernel_config["math_fidelity"] = _enum_value("MathFidelity", compute_text, "math_fidelity")
+        compute_kernel_config["throttle_level"] = _enum_value("ThrottleLevel", compute_text, "throttle_level")
+        entries.append(
+            {
+                "compute_kernel_config": compute_kernel_config,
+                "entry_id": entry_id,
+                "key": key,
+                "program_config": program_config,
+            }
+        )
+    return entries
+
+
+def checked_in_source() -> str:
+    return (CHECKED_IN_GENERATED_DIR / "matmul_registry_data.cpp").read_text()
+
+
+def test_checked_in_table_matches_the_content_digest_it_serves() -> None:
+    source = checked_in_source()
+    declared = _hex_from_byte_literal(
+        _ENTRY_BYTES_RE.search(source.split(".content_sha256 = ", 1)[1]).group(1)
+    )
+    assert set(declared) != {"0"}, "the runtime refuses a table whose content digest is zero"
+    policy = re.search(r"//\s+selection_policy\s+:\s+(\S+)", source).group(1)
+    entries = parse_checked_in_entries(source)
+    recomputed = hashlib.sha256(
+        json.dumps({"entries": entries, "policy": policy}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert recomputed == declared, "checked-in table does not hash to the content_sha256 it declares"
+
+
+def test_checked_in_table_agrees_with_its_declared_provenance() -> None:
+    source = checked_in_source()
+    entries = parse_checked_in_entries(source)
+    declared_count = int(re.search(r"//\s+entries\s+:\s+(\d+)", source).group(1))
+    array_count = int(re.search(r"ProgramConfigExactEntry, (\d+)>", source).group(1))
+    assert declared_count == array_count == len(entries)
+
+    banner_domains = json.loads(re.search(r"//\s+domains\s+:\s+(\{.*\})", source).group(1))
+    banner_dtypes = json.loads(re.search(r"//\s+weight dtypes\s+:\s+(\{.*\})", source).group(1))
+    assert banner_domains == dict(collections.Counter(e["key"]["domain"] for e in entries))
+    assert banner_dtypes == dict(collections.Counter(e["key"]["input_b"]["dtype"] for e in entries))
+
+
+def test_checked_in_table_exercises_the_appended_bfloat4b_enumerator() -> None:
+    entries = parse_checked_in_entries(checked_in_source())
+    bfloat4 = [e for e in entries if e["key"]["input_b"]["dtype"] == "bfloat4_b"]
+    assert bfloat4, "no bfp4 entries: compact::DataType::BFloat4B would be dead weight"
+    # Nothing may key a weight precision the descriptor enum cannot spell.
+    assert {e["key"]["input_b"]["dtype"] for e in entries} <= set(_CPP_TO_JSON["DataType"].values())
+
+
+def test_checked_in_header_declares_the_table_accessors() -> None:
+    header = (CHECKED_IN_GENERATED_DIR / "matmul_registry_data.hpp").read_text()
+    assert "matmul_registry_exact.hpp" in header
+    assert "const compact::TableMetadata& metadata() noexcept;" in header
+    assert "std::span<const compact::ProgramConfigExactEntry> program_config_exact_entries() noexcept;" in header
+
+
+def test_legacy_lock_still_validates_but_no_longer_describes_the_shipped_table() -> None:
+    """The lock is kept as the previous table's record, not as the build input."""
+
+    legacy = emitter.validate_lock(emitter.load_lock(CHECKED_IN_LOCK_PATH))
+    _, legacy_source = emitter.emit(legacy)
+    assert legacy_source != (CHECKED_IN_GENERATED_DIR / "matmul_registry_data.cpp").read_bytes()
+    assert len(legacy["program_config_exact_entries"]) < len(parse_checked_in_entries(checked_in_source()))
 
 
 def test_semantic_source_is_emitted_as_inert_provenance() -> None:

@@ -7,8 +7,8 @@ set(MATMUL_REGISTRY_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/device/config/registr
 set(MATMUL_REGISTRY_GENERATED_DIR ${MATMUL_REGISTRY_SOURCE_DIR}/checked_in)
 set(MATMUL_REGISTRY_GENERATED_SOURCE ${MATMUL_REGISTRY_GENERATED_DIR}/matmul_registry_data.cpp)
 # Registry promotion remains an offline release step. Normal TTNN builds never
-# regenerate or parse the reviewed lock; they compile the reviewed table that
-# emit_cpp.py checked in alongside it.
+# regenerate or parse anything here; they compile the reviewed table checked in
+# under checked_in/, which the offline builder emits directly.
 set_source_files_properties(
     ${MATMUL_REGISTRY_GENERATED_SOURCE}
     PROPERTIES

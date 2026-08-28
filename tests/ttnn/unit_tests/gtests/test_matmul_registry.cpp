@@ -68,6 +68,14 @@ MatmulRegistryRequest checked_in_request(const OperationDomain domain = Operatio
     return result;
 }
 
+// The checked-in table carries this same M/K/N at 12x10 with a bfp4 weight, so
+// only the input_b precision separates it from checked_in_request().
+MatmulRegistryRequest checked_in_bfloat4b_request(const OperationDomain domain = OperationDomain::DenseMatmul) {
+    auto result = checked_in_request(domain);
+    result.input_b = tensor_request(DataType::BFLOAT4_B);
+    return result;
+}
+
 Eligibility eligibility(const OperationDomain domain = OperationDomain::DenseMatmul) {
     return Eligibility{.call = semantics(domain)};
 }
@@ -412,6 +420,35 @@ TEST(MatmulConfigRegistry, OffShadowAndOnHaveDistinctMutationAndTelemetryContrac
     EXPECT_EQ(snapshot.certified_hits, 2U);
     EXPECT_EQ(snapshot.selected_hits, 1U);
     EXPECT_EQ(snapshot.reasons[static_cast<std::size_t>(ResolutionReason::CertifiedMatch)], 2U);
+}
+
+TEST(MatmulConfigRegistry, CompactDataTypeEnumeratorsAreAppendOnly) {
+    // The emitter's sort key and the selector ABI both assume these values.
+    // Renumbering silently reorders every checked-in key.
+    EXPECT_EQ(static_cast<std::uint8_t>(compact::DataType::BFloat16), 0U);
+    EXPECT_EQ(static_cast<std::uint8_t>(compact::DataType::BFloat8B), 1U);
+    EXPECT_EQ(static_cast<std::uint8_t>(compact::DataType::Float32), 2U);
+    EXPECT_EQ(static_cast<std::uint8_t>(compact::DataType::BFloat4B), 3U);
+}
+
+TEST(MatmulConfigRegistry, Bfloat4BWeightsResolveAgainstTheCheckedInTable) {
+    RuntimeStateReset reset;
+    const auto req = checked_in_bfloat4b_request();
+    const auto eligible = eligibility();
+    const ttnn::prim::MatmulParams legacy;
+
+    // Without the BFLOAT4_B -> compact::BFloat4B mapping the key is nullopt and
+    // every bfp4 entry in the table is silently unreachable.
+    const auto key = compact_registry_key(req);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(key->input_b.dtype, compact::DataType::BFloat4B);
+
+    const auto on = resolve_for_dispatch(Mode::On, req, eligible, legacy);
+    EXPECT_EQ(on.resolution.reason, ResolutionReason::CertifiedMatch);
+    EXPECT_EQ(on.action, ExecutionAction::ApplyRecipe);
+    ASSERT_TRUE(on.materialized_parameters.has_value());
+    EXPECT_TRUE(on.materialized_parameters->program_config.has_value());
+    EXPECT_TRUE(on.materialized_parameters->compute_kernel_config.has_value());
 }
 
 TEST(MatmulConfigRegistry, MaterializationFailureBreaksOnlyAffectedDomain) {

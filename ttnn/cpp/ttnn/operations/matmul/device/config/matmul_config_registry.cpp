@@ -74,6 +74,7 @@ std::optional<compact::DataType> compact_dtype(const tt::tt_metal::DataType dtyp
         case tt::tt_metal::DataType::BFLOAT16: return compact::DataType::BFloat16;
         case tt::tt_metal::DataType::BFLOAT8_B: return compact::DataType::BFloat8B;
         case tt::tt_metal::DataType::FLOAT32: return compact::DataType::Float32;
+        case tt::tt_metal::DataType::BFLOAT4_B: return compact::DataType::BFloat4B;
         default: return std::nullopt;
     }
 }

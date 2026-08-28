@@ -16,9 +16,10 @@ namespace ttnn::operations::matmul::registry::compact {
 inline constexpr std::uint16_t kCodegenRecipeAbi = 2;
 
 enum class Domain : std::uint8_t { DenseMatmul = 0, DenseLinear = 1, DenseAddmm = 2 };
-// Enumerator values are stable selector ABI. emit_cpp.py explicitly reorders
-// canonically reviewed lock entries into this POD's defaulted runtime order.
-enum class DataType : std::uint8_t { BFloat16 = 0, BFloat8B = 1, Float32 = 2 };
+// Enumerator values are stable selector ABI: a table emitter sorts checked-in
+// entries by these ordinals and the runtime binary-searches in that order, so a
+// new precision is appended and an existing value is never renumbered.
+enum class DataType : std::uint8_t { BFloat16 = 0, BFloat8B = 1, Float32 = 2, BFloat4B = 3 };
 enum class Layout : std::uint8_t { RowMajor = 0, Tile = 1 };
 enum class MemoryLayout : std::uint8_t { Interleaved = 0 };
 enum class BufferType : std::uint8_t { Dram = 0, L1 = 1 };
