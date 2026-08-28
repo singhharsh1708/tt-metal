@@ -271,7 +271,6 @@ inline void calculate_cosine() {
         C1 = 0x1.10c2a2p-7f;
         C0 = -0x1.5554a4p-3f;
     }
-    sfpi::vFloat C3 = sfpi::vConstFloatPrgm3;
 
     const float ROUNDING_BIAS = 12582912.0f;
     const float NEG_ROUNDING_BIAS = -12582912.0f;
