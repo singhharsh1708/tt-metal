@@ -97,6 +97,18 @@ RegistryRequestInspection inspect_registry_request(
             .tile_width = tile.get_width(),
         };
     };
+    // The caller's compute kernel config is a key axis, not something the
+    // registry may replace, so it has to be representable before a lookup is
+    // meaningful. An unrepresentable knob leaves the request unbuilt and the
+    // call on the legacy path.
+    std::optional<compact::ComputeKernelDescriptor> user_compute_kernel_config;
+    if (parameters.compute_kernel_config.has_value()) {
+        user_compute_kernel_config = compact_compute_kernel_config(*parameters.compute_kernel_config);
+        if (!user_compute_kernel_config.has_value()) {
+            return inspection;
+        }
+    }
+
     const auto grid = device_a->compute_with_storage_grid_size();
     std::optional<std::uint32_t> activation_op;
     std::array<std::uint32_t, MatmulRegistryRequest::kMaxActivationParameters> activation_params{};
@@ -112,7 +124,7 @@ RegistryRequestInspection inspect_registry_request(
     }
 
     inspection.request = MatmulRegistryRequest{
-        .schema_version = 1,
+        .schema_version = compact::kKeySchemaVersion,
         .call = call_semantics,
         .workload =
             WorkloadRequest{
@@ -153,6 +165,7 @@ RegistryRequestInspection inspect_registry_request(
         .activation_op = activation_op,
         .activation_param_f32_bits = activation_params,
         .activation_param_count = activation_param_count,
+        .user_compute_kernel_config = user_compute_kernel_config,
     };
     return inspection;
 }
@@ -217,16 +230,26 @@ bool try_apply_registry_parameters(
         return false;
     }
 
+    // A caller who supplied a compute kernel config keeps it. The lookup was
+    // keyed on their exact knobs, so the recipe was measured under the
+    // configuration they asked for and there is nothing to write back; the
+    // registry owns program_config alone on this path.
+    const bool compute_kernel_config_is_caller_owned = parameters.compute_kernel_config.has_value();
     try {
-        // Preflight proved both fields were absent. Commit only the paired
-        // registry-owned axes; caller-owned state never participates in this
-        // assignment and a partial failure can restore the proven empty state.
+        // Preflight proved program_config was absent, and compute_kernel_config
+        // is written only when preflight also proved that absent. Caller-owned
+        // state never participates in this assignment, and a partial failure
+        // can restore the proven empty state.
         parameters.program_config = std::move(dispatch.materialized_parameters->program_config);
-        parameters.compute_kernel_config = dispatch.materialized_parameters->compute_kernel_config;
+        if (!compute_kernel_config_is_caller_owned) {
+            parameters.compute_kernel_config = dispatch.materialized_parameters->compute_kernel_config;
+        }
         return true;
     } catch (...) {
         parameters.program_config.reset();
-        parameters.compute_kernel_config.reset();
+        if (!compute_kernel_config_is_caller_owned) {
+            parameters.compute_kernel_config.reset();
+        }
         circuit_break_domain(call_semantics.domain);
         return false;
     }

@@ -29702,6 +29702,19 @@ constexpr bool program_config_exact_entries_are_legal() {
     return true;
 }
 static_assert(program_config_exact_entries_are_legal());
+// Every entry's recipe must be spelled with exactly the compute-kernel knobs
+// its key binds; otherwise resolving that key would answer a caller with
+// numerics they never asked for. See compact::entries_bind_key_compute_kernel.
+constexpr bool program_config_exact_entries_bind_compute_kernel() {
+    return compact::entries_bind_key_compute_kernel(kProgramConfigExactEntries);
+}
+static_assert(program_config_exact_entries_bind_compute_kernel());
+// The key drops math_approx_mode only while no admitted call carries a fused
+// activation. See compact::entries_permit_math_approx_normalization.
+constexpr bool program_config_exact_entries_permit_math_approx_normalization() {
+    return compact::entries_permit_math_approx_normalization(kProgramConfigExactEntries);
+}
+static_assert(program_config_exact_entries_permit_math_approx_normalization());
 }  // namespace
 const compact::TableMetadata& metadata() noexcept { return kMetadata; }
 std::span<const compact::ProgramConfigExactEntry> program_config_exact_entries() noexcept {

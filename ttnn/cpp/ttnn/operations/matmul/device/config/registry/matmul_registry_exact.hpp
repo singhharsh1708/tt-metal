@@ -69,6 +69,50 @@ inline constexpr const ProgramConfigExactEntry* lookup_program_config_exact(
     return candidate != entries.end() && candidate->key == key ? &*candidate : nullptr;
 }
 
+// A table entry's compute_kernel_config is the configuration the entry was
+// measured under, and KeyDescriptor::compute_kernel is the configuration a call
+// must be asking for to be allowed to reuse that measurement. The two are the
+// same fact, so they must be spelled identically; an entry that disagrees would
+// answer a lookup by silently substituting knobs the caller never asked for.
+// This is checked at compile time over the emitted table and again at runtime
+// before any entry is served, so neither a bad emitter nor a stale artifact can
+// reintroduce the substitution.
+constexpr bool entry_binds_key_compute_kernel(const ProgramConfigExactEntry& entry) noexcept {
+    return entry.compute_kernel_config == entry.key.compute_kernel;
+}
+
+constexpr bool entries_bind_key_compute_kernel(const std::span<const ProgramConfigExactEntry> entries) noexcept {
+    for (const auto& entry : entries) {
+        if (!entry_binds_key_compute_kernel(entry)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The runtime key normalizes math_approx_mode to false rather than keying it
+// (see normalize_key_compute_kernel), which is sound only because no admitted
+// call carries a fused activation and so no admitted kernel contains an SFPU op
+// for the knob to configure. Every shipped entry must therefore be
+// activation-free and carry the normalized spelling; an entry that is not would
+// be reachable from a key that no longer describes it. This turns the runtime
+// precondition into a build failure at the moment an activation-carrying entry
+// is first emitted.
+constexpr bool entry_permits_math_approx_normalization(const ProgramConfigExactEntry& entry) noexcept {
+    return !entry.key.has_activation && !entry.program_config.fused_activation_present &&
+           !entry.key.compute_kernel.math_approx_mode;
+}
+
+constexpr bool entries_permit_math_approx_normalization(
+    const std::span<const ProgramConfigExactEntry> entries) noexcept {
+    for (const auto& entry : entries) {
+        if (!entry_permits_math_approx_normalization(entry)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Bank evidence is portable across board identities, but not harvested worker
 // grids: distinct 11x10, 12x10, and 13x10 winners remain distinct exact keys.
 constexpr KeyDescriptor direct_bank_key(KeyDescriptor key) noexcept {

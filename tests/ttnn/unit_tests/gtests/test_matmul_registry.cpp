@@ -44,7 +44,7 @@ CallSemantics semantics(const OperationDomain domain) {
 
 MatmulRegistryRequest request(const OperationDomain domain = OperationDomain::DenseMatmul) {
     return MatmulRegistryRequest{
-        .schema_version = 1,
+        .schema_version = compact::kKeySchemaVersion,
         .call = semantics(domain),
         .workload = {.logical_m = 64, .logical_k = 64, .logical_n = 64, .padded_m = 64, .padded_k = 64, .padded_n = 64},
         .input_a = tensor_request(),
@@ -88,6 +88,19 @@ compact::ComputeKernelDescriptor kernel(const compact::ThrottleLevel throttle = 
         .fp32_dest_acc_en = false,
         .packer_l1_acc = true,
         .dst_full_sync_en = false};
+}
+
+// A call that names its own compute kernel configuration. Those knobs are a
+// key axis, so the request and the eligibility have to agree that they are set.
+MatmulRegistryRequest request_with_kernel(MatmulRegistryRequest runtime_request, compact::ComputeKernelDescriptor ckc) {
+    runtime_request.user_compute_kernel_config = ckc;
+    return runtime_request;
+}
+
+Eligibility eligibility_with_kernel(const OperationDomain domain = OperationDomain::DenseMatmul) {
+    auto result = eligibility(domain);
+    result.has_compute_kernel_config = true;
+    return result;
 }
 
 compact::ProgramConfigDescriptor reuse_program(const std::uint16_t grid_x = 2) {
@@ -165,7 +178,7 @@ compact::ProgramConfigDescriptor multicast_2d_program() {
 compact::TableMetadata metadata(const bool exact = true) {
     return compact::TableMetadata{
         .lock_schema_version = 2,
-        .key_schema_version = 1,
+        .key_schema_version = compact::kKeySchemaVersion,
         .exact_recipe_evidence_schema_version = exact ? std::uint16_t{2} : std::uint16_t{0},
         .matmul_kernel_equivalence_schema_version = exact ? std::uint16_t{1} : std::uint16_t{0},
         .content_sha256 = digest(1),
@@ -179,6 +192,10 @@ compact::ProgramConfigExactEntry exact_entry(
     const std::optional<std::uint16_t> grid_x = std::nullopt) {
     auto key = *compact_registry_key(runtime_request);
     key.compute_grid_x = grid_x.value_or(key.compute_grid_x);
+    // The key binds the configuration the recipe was measured under, so an
+    // emitted entry always agrees with itself. compact::entry_binds_key_compute_kernel
+    // is the shipped table's compile-time form of this same assignment.
+    key.compute_kernel = ckc;
     return compact::ProgramConfigExactEntry{
         .entry_id = digest(11), .key = key, .program_config = program, .compute_kernel_config = ckc};
 }
@@ -195,17 +212,15 @@ TEST(MatmulConfigRegistry, BlackholeKeyUsesNativeArchitectureAndPortablePhysical
 TEST(MatmulConfigRegistry, ExactMatchPreservesHarvestedGridCohorts) {
     auto live = request();
     const std::array entries{
-        exact_entry(live, reuse_program(2), kernel(compact::ThrottleLevel::Throttle1), 11),
-        exact_entry(live, reuse_program(2), kernel(compact::ThrottleLevel::Throttle2), 12),
-        exact_entry(live, reuse_program(2), kernel(compact::ThrottleLevel::Throttle3), 13)};
+        exact_entry(live, reuse_program(1), kernel(), 11),
+        exact_entry(live, reuse_program(2), kernel(), 12),
+        exact_entry(live, reuse_program(3), kernel(), 13)};
     for (const std::uint32_t grid_x : {11U, 12U, 13U}) {
         live.device.compute_grid_x = grid_x;
         const auto result = resolve_with_compact_table_for_testing(live, eligibility(), metadata(), entries);
         EXPECT_EQ(result.reason, ResolutionReason::CertifiedMatch);
         ASSERT_TRUE(result.program_config.has_value());
-        EXPECT_EQ(result.program_config->compute_grid_x, 2);
-        ASSERT_TRUE(result.compute_kernel_config.has_value());
-        EXPECT_EQ(result.compute_kernel_config->throttle_level, static_cast<compact::ThrottleLevel>(grid_x - 10));
+        EXPECT_EQ(result.program_config->compute_grid_x, grid_x - 10);
     }
     live.device.compute_grid_x = 10;
     EXPECT_EQ(
@@ -225,13 +240,13 @@ TEST(MatmulConfigRegistry, ExactArchitectureNeverCrossMatches) {
 
 TEST(MatmulConfigRegistry, KernelEquivalentPublicWrappersReuseDenseMeasurements) {
     const auto dense = request();
-    const auto entry = exact_entry(dense, reuse_program(2), kernel(compact::ThrottleLevel::Throttle3));
+    const auto entry = exact_entry(dense, reuse_program(3), kernel());
     for (const auto domain : {OperationDomain::Linear, OperationDomain::Addmm}) {
         const auto result = resolve_with_compact_table_for_testing(
             request(domain), eligibility(domain), metadata(), std::span{&entry, std::size_t{1}});
         EXPECT_EQ(result.reason, ResolutionReason::CertifiedMatch);
-        ASSERT_TRUE(result.compute_kernel_config.has_value());
-        EXPECT_EQ(result.compute_kernel_config->throttle_level, compact::ThrottleLevel::Throttle3);
+        ASSERT_TRUE(result.program_config.has_value());
+        EXPECT_EQ(result.program_config->compute_grid_x, 3);
     }
 }
 
@@ -290,21 +305,20 @@ TEST(MatmulConfigRegistry, OperationSpecificRecipePrecedesDenseWrapperFallback) 
     const auto dense = request();
     const auto linear = request(OperationDomain::Linear);
     const std::array entries{
-        exact_entry(dense, reuse_program(2), kernel(compact::ThrottleLevel::Throttle1)),
-        exact_entry(linear, reuse_program(2), kernel(compact::ThrottleLevel::Throttle4))};
+        exact_entry(dense, reuse_program(1), kernel()), exact_entry(linear, reuse_program(3), kernel())};
     const auto result =
         resolve_with_compact_table_for_testing(linear, eligibility(OperationDomain::Linear), metadata(), entries);
     EXPECT_EQ(result.reason, ResolutionReason::CertifiedMatch);
-    ASSERT_TRUE(result.compute_kernel_config.has_value());
-    EXPECT_EQ(result.compute_kernel_config->throttle_level, compact::ThrottleLevel::Throttle4);
+    ASSERT_TRUE(result.program_config.has_value());
+    EXPECT_EQ(result.program_config->compute_grid_x, 3);
 
     auto unproven = metadata();
     unproven.matmul_kernel_equivalence_schema_version = 0;
     const auto direct_result =
         resolve_with_compact_table_for_testing(linear, eligibility(OperationDomain::Linear), unproven, entries);
     EXPECT_EQ(direct_result.reason, ResolutionReason::CertifiedMatch);
-    ASSERT_TRUE(direct_result.compute_kernel_config.has_value());
-    EXPECT_EQ(direct_result.compute_kernel_config->throttle_level, compact::ThrottleLevel::Throttle4);
+    ASSERT_TRUE(direct_result.program_config.has_value());
+    EXPECT_EQ(direct_result.program_config->compute_grid_x, 3);
 }
 
 TEST(MatmulConfigRegistry, ExactKeyBindsBothInputAndOutputDtypes) {
@@ -330,9 +344,9 @@ TEST(MatmulConfigRegistry, ExactKeyBindsBothInputAndOutputDtypes) {
 }
 
 TEST(MatmulConfigRegistry, ExactCarriesPairedRecipe) {
-    const auto req = request();
+    const auto req = request_with_kernel(request(), kernel(compact::ThrottleLevel::Throttle3));
     const auto entry = exact_entry(req, reuse_program(2), kernel(compact::ThrottleLevel::Throttle3));
-    const auto result = resolve_with_compact_table_for_testing(req, eligibility(), metadata(), {&entry, 1});
+    const auto result = resolve_with_compact_table_for_testing(req, eligibility_with_kernel(), metadata(), {&entry, 1});
     EXPECT_EQ(result.reason, ResolutionReason::CertifiedMatch);
     ASSERT_TRUE(result.compute_kernel_config.has_value());
     EXPECT_EQ(result.compute_kernel_config->throttle_level, compact::ThrottleLevel::Throttle3);
@@ -360,16 +374,19 @@ TEST(MatmulConfigRegistry, EveryExplicitTuningAxisBypassesBeforeLookup) {
     RuntimeStateReset reset;
     const auto req = request();
     ttnn::prim::MatmulParams legacy;
-    for (const auto axis : {0, 1, 2}) {
+    for (const auto axis : {0, 1}) {
         auto eligible = eligibility();
         eligible.has_program_config = axis == 0;
-        eligible.has_compute_kernel_config = axis == 1;
-        eligible.has_user_core_grid = axis == 2;
+        eligible.has_user_core_grid = axis == 1;
         EXPECT_EQ(preflight_v1_eligibility(eligible), ResolutionReason::ExplicitOverride);
         const auto dispatched = resolve_for_dispatch(Mode::On, req, eligible, legacy);
         EXPECT_EQ(dispatched.resolution.reason, ResolutionReason::ExplicitOverride);
         EXPECT_FALSE(dispatched.materialized_parameters.has_value());
     }
+    // A caller-supplied compute kernel config is not an override of anything
+    // the registry answers: it is bound into the key instead, so the lookup
+    // proceeds and the dispatch leaves that field to its owner.
+    EXPECT_EQ(preflight_v1_eligibility(eligibility_with_kernel()), ResolutionReason::CertifiedMatch);
 }
 
 TEST(MatmulConfigRegistry, StartupModeDefaultsOffAndFreezesOnFirstUse) {
@@ -539,9 +556,10 @@ TEST(MatmulConfigRegistry, ComputeKernelMaterializationCoversThrottleZeroThrough
 }
 
 TEST(MatmulConfigRegistry, PairedMaterializationPreservesAllCallerOwnedState) {
-    const auto req = request();
+    const auto req = request_with_kernel(request(), kernel(compact::ThrottleLevel::Throttle4));
     const auto entry = exact_entry(req, multicast_2d_program(), kernel(compact::ThrottleLevel::Throttle4));
-    const auto selected = resolve_with_compact_table_for_testing(req, eligibility(), metadata(), {&entry, 1});
+    const auto selected =
+        resolve_with_compact_table_for_testing(req, eligibility_with_kernel(), metadata(), {&entry, 1});
     ttnn::prim::MatmulParams legacy;
     legacy.output_dtype = DataType::FLOAT32;
     legacy.user_run_batched = false;
@@ -582,6 +600,151 @@ TEST(MatmulConfigRegistry, CheckedTableReportsSemanticSourceAsInertProvenance) {
     // without any attestation precondition.
     EXPECT_NE(snapshot.semantic_source_sha256, compact::Sha256{});
     EXPECT_EQ(preflight_v1_eligibility(eligibility()), ResolutionReason::CertifiedMatch);
+}
+
+TEST(MatmulConfigRegistry, DefaultComputeKernelKnobsReproduceCreateMatmulAttributes) {
+    const auto blackhole = static_cast<std::uint32_t>(tt::ARCH::BLACKHOLE);
+    const auto wormhole = static_cast<std::uint32_t>(tt::ARCH::WORMHOLE_B0);
+    using compact::DataType;
+    using compact::MathFidelity;
+
+    // Neither input low precision, so create_matmul_attributes() raises the
+    // fidelity: HiFi2, packer L1 accumulation on, fp32 dest accumulation off.
+    const auto bf16 =
+        default_compute_kernel_descriptor(blackhole, DataType::BFloat16, DataType::BFloat16, DataType::BFloat16);
+    EXPECT_EQ(bf16.math_fidelity, MathFidelity::HiFi2);
+    EXPECT_FALSE(bf16.math_approx_mode);
+    EXPECT_FALSE(bf16.fp32_dest_acc_en);
+    EXPECT_TRUE(bf16.packer_l1_acc);
+    EXPECT_FALSE(bf16.dst_full_sync_en);
+    EXPECT_EQ(bf16.throttle_level, compact::ThrottleLevel::NoThrottle);
+
+    // Both inputs low precision drops it back to LoFi; one of the two does not.
+    EXPECT_EQ(
+        default_compute_kernel_descriptor(blackhole, DataType::BFloat8B, DataType::BFloat4B, DataType::BFloat16)
+            .math_fidelity,
+        MathFidelity::LoFi);
+    EXPECT_EQ(
+        default_compute_kernel_descriptor(blackhole, DataType::BFloat16, DataType::BFloat8B, DataType::BFloat16)
+            .math_fidelity,
+        MathFidelity::HiFi2);
+
+    // FLOAT32 inputs override both, and Wormhole takes HiFi3 for hardware bug
+    // #38306 where every other architecture takes HiFi4.
+    EXPECT_EQ(
+        default_compute_kernel_descriptor(blackhole, DataType::Float32, DataType::Float32, DataType::BFloat16)
+            .math_fidelity,
+        MathFidelity::HiFi4);
+    EXPECT_EQ(
+        default_compute_kernel_descriptor(wormhole, DataType::Float32, DataType::Float32, DataType::BFloat16)
+            .math_fidelity,
+        MathFidelity::HiFi3);
+
+    // A FLOAT32 output swaps the two accumulation knobs.
+    const auto f32_out =
+        default_compute_kernel_descriptor(blackhole, DataType::Float32, DataType::Float32, DataType::Float32);
+    EXPECT_TRUE(f32_out.fp32_dest_acc_en);
+    EXPECT_FALSE(f32_out.packer_l1_acc);
+}
+
+TEST(MatmulConfigRegistry, DefaultKnobsAreTheKeyWhenTheCallerNamesNone) {
+    const auto key = compact_registry_key(request());
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(
+        key->compute_kernel,
+        default_compute_kernel_descriptor(
+            static_cast<std::uint32_t>(tt::ARCH::BLACKHOLE),
+            compact::DataType::BFloat16,
+            compact::DataType::BFloat16,
+            compact::DataType::BFloat16));
+}
+
+TEST(MatmulConfigRegistry, ComputeKernelConfigRoundTripsThroughTheCompactSpelling) {
+    const auto compact_config = kernel(compact::ThrottleLevel::Throttle5);
+    const auto native = materialize_registry_compute_kernel_config(compact_config);
+    ASSERT_TRUE(native.has_value());
+    const auto round_tripped = compact_compute_kernel_config(*native);
+    ASSERT_TRUE(round_tripped.has_value());
+    EXPECT_EQ(*round_tripped, compact_config);
+}
+
+TEST(MatmulConfigRegistry, RecipeMeasuredAtOtherKnobsIsUnreachable) {
+    // A recipe harvested at LoFi is not an answer for a call that asks for --
+    // or defaults to -- HiFi2. Before the knobs were keyed, this lookup hit and
+    // silently rewrote the caller's fidelity.
+    auto lofi = kernel();
+    lofi.math_fidelity = compact::MathFidelity::LoFi;
+    const auto lofi_request = request_with_kernel(request(), lofi);
+    const auto entry = exact_entry(lofi_request, reuse_program(2), lofi);
+
+    EXPECT_EQ(
+        resolve_with_compact_table_for_testing(request(), eligibility(), metadata(), {&entry, 1}).reason,
+        ResolutionReason::EmptyRegistry);
+
+    const auto matched =
+        resolve_with_compact_table_for_testing(lofi_request, eligibility_with_kernel(), metadata(), {&entry, 1});
+    EXPECT_EQ(matched.reason, ResolutionReason::CertifiedMatch);
+    ASSERT_TRUE(matched.compute_kernel_config.has_value());
+    EXPECT_EQ(*matched.compute_kernel_config, lofi);
+}
+
+TEST(MatmulConfigRegistry, MathApproxModeIsNormalizedOutOfTheKey) {
+    // math_approx_mode only configures the SFPU, and no admitted call has an
+    // SFPU op: preflight rejects has_activation. Keying it would halve the
+    // reach of every measurement for no numerical difference, so both
+    // spellings resolve to one key and one entry.
+    auto approximate = kernel();
+    approximate.math_approx_mode = true;
+    const auto approximate_key = compact_registry_key(request_with_kernel(request(), approximate));
+    const auto default_key = compact_registry_key(request());
+    ASSERT_TRUE(approximate_key.has_value());
+    ASSERT_TRUE(default_key.has_value());
+    EXPECT_FALSE(approximate_key->compute_kernel.math_approx_mode);
+    EXPECT_EQ(approximate_key->compute_kernel, default_key->compute_kernel);
+
+    // The entry is measured precise, the way the emitter normalizes it. A
+    // caller who asked for the approximate spelling still resolves, and keeps
+    // their own spelling because the dispatch never writes that field back.
+    const auto entry = exact_entry(request(), reuse_program(2), kernel());
+    const auto matched = resolve_with_compact_table_for_testing(
+        request_with_kernel(request(), approximate), eligibility_with_kernel(), metadata(), {&entry, 1});
+    EXPECT_EQ(matched.reason, ResolutionReason::CertifiedMatch);
+    EXPECT_TRUE(compact::entry_permits_math_approx_normalization(entry));
+}
+
+TEST(MatmulConfigRegistry, NormalizationTouchesNothingButMathApproxMode) {
+    // The other five knobs select arithmetic and stay strict; fidelity is the
+    // one that made a LoFi measurement answer a HiFi2 call.
+    auto knobs = kernel(compact::ThrottleLevel::Throttle2);
+    knobs.math_fidelity = compact::MathFidelity::HiFi4;
+    knobs.math_approx_mode = true;
+    knobs.fp32_dest_acc_en = true;
+    knobs.packer_l1_acc = false;
+    knobs.dst_full_sync_en = true;
+    auto expected = knobs;
+    expected.math_approx_mode = false;
+    EXPECT_EQ(normalize_key_compute_kernel(knobs), expected);
+}
+
+TEST(MatmulConfigRegistry, EntryWhoseRecipeDisagreesWithItsKeyIsRefused) {
+    // The compile-time compact::entries_bind_key_compute_kernel check covers the
+    // shipped table; a table that reaches the runtime without it still may not
+    // substitute knobs the caller never asked for.
+    const auto req = request();
+    auto entry = exact_entry(req);
+    entry.compute_kernel_config.math_fidelity = compact::MathFidelity::HiFi4;
+    EXPECT_FALSE(compact::entry_binds_key_compute_kernel(entry));
+    EXPECT_EQ(
+        resolve_with_compact_table_for_testing(req, eligibility(), metadata(), {&entry, 1}).reason,
+        ResolutionReason::MaterializationRejected);
+}
+
+TEST(MatmulConfigRegistry, RequestAndEligibilityMustAgreeOnCallerSuppliedKnobs) {
+    EXPECT_EQ(
+        validate_v1_request_envelope(request_with_kernel(request(), kernel()), eligibility()),
+        ResolutionReason::InconsistentRequest);
+    EXPECT_EQ(
+        validate_v1_request_envelope(request(), eligibility_with_kernel()), ResolutionReason::InconsistentRequest);
 }
 
 }  // namespace

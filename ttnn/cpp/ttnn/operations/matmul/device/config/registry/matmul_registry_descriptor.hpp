@@ -15,6 +15,14 @@ namespace ttnn::operations::matmul::registry::compact {
 // exporter/runtime contract rather than a local literal update.
 inline constexpr std::uint16_t kCodegenRecipeAbi = 2;
 
+// Layout version of KeyDescriptor itself. It is bound into every key
+// (KeyDescriptor::schema_version), asserted against a table's
+// TableMetadata::key_schema_version before that table may be served, and
+// mirrored by the emitter's KEY_SCHEMA_VERSION. Version 2 added
+// KeyDescriptor::compute_kernel, so a version-1 table can no longer be
+// interpreted and must be regenerated.
+inline constexpr std::uint16_t kKeySchemaVersion = 2;
+
 enum class Domain : std::uint8_t { DenseMatmul = 0, DenseLinear = 1, DenseAddmm = 2 };
 // Enumerator values are stable selector ABI: a table emitter sorts checked-in
 // entries by these ordinals and the runtime binary-searches in that order, so a
@@ -46,6 +54,17 @@ struct TensorDescriptor {
     std::uint16_t tile_width{};
 
     auto operator<=>(const TensorDescriptor&) const = default;
+};
+
+struct ComputeKernelDescriptor {
+    MathFidelity math_fidelity{};
+    ThrottleLevel throttle_level{};
+    bool math_approx_mode{};
+    bool fp32_dest_acc_en{};
+    bool packer_l1_acc{};
+    bool dst_full_sync_en{};
+
+    auto operator<=>(const ComputeKernelDescriptor&) const = default;
 };
 
 struct KeyDescriptor {
@@ -85,19 +104,22 @@ struct KeyDescriptor {
     Domain domain{};
     std::uint32_t alpha_f32_bits{};
     std::uint32_t beta_f32_bits{};
+    // The compute-kernel knobs are an input to the measurement, not an output
+    // of it. Every one of them is user-suppliable through
+    // DeviceComputeKernelConfig, and five of the six (fidelity, approx mode,
+    // fp32 dest accumulation, packer L1 accumulation, full dest sync) select
+    // different arithmetic, so a recipe measured under one setting is not a
+    // valid answer for a call that asked for another. Keyed only by shape and
+    // dtype, a lookup would hand a caller who asked for -- or would have
+    // defaulted to -- HiFi2 a recipe harvested at LoFi and silently return
+    // different numbers. Binding them here makes a measurement reusable exactly
+    // when the call requests the knobs it was measured with; the resolver then
+    // never has to overwrite a caller's own configuration, and
+    // compact::entries_bind_key_compute_kernel() proves every shipped value was
+    // measured with the knobs its key binds.
+    ComputeKernelDescriptor compute_kernel{};
 
     auto operator<=>(const KeyDescriptor&) const = default;
-};
-
-struct ComputeKernelDescriptor {
-    MathFidelity math_fidelity{};
-    ThrottleLevel throttle_level{};
-    bool math_approx_mode{};
-    bool fp32_dest_acc_en{};
-    bool packer_l1_acc{};
-    bool dst_full_sync_en{};
-
-    auto operator<=>(const ComputeKernelDescriptor&) const = default;
 };
 
 struct TableMetadata {

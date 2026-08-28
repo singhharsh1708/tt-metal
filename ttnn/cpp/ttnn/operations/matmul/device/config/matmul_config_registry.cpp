@@ -95,6 +95,29 @@ std::optional<compact::BufferType> compact_buffer_type(const tt::tt_metal::Buffe
     }
 }
 
+std::optional<compact::MathFidelity> compact_math_fidelity(const tt::tt_metal::MathFidelity fidelity) noexcept {
+    switch (fidelity) {
+        case tt::tt_metal::MathFidelity::LoFi: return compact::MathFidelity::LoFi;
+        case tt::tt_metal::MathFidelity::HiFi2: return compact::MathFidelity::HiFi2;
+        case tt::tt_metal::MathFidelity::HiFi3: return compact::MathFidelity::HiFi3;
+        case tt::tt_metal::MathFidelity::HiFi4: return compact::MathFidelity::HiFi4;
+        default: return std::nullopt;
+    }
+}
+
+std::optional<compact::ThrottleLevel> compact_throttle_level(
+    const compute_throttle_utils::ThrottleLevel throttle) noexcept {
+    switch (throttle) {
+        case compute_throttle_utils::ThrottleLevel::NO_THROTTLE: return compact::ThrottleLevel::NoThrottle;
+        case compute_throttle_utils::ThrottleLevel::LEVEL_1: return compact::ThrottleLevel::Throttle1;
+        case compute_throttle_utils::ThrottleLevel::LEVEL_2: return compact::ThrottleLevel::Throttle2;
+        case compute_throttle_utils::ThrottleLevel::LEVEL_3: return compact::ThrottleLevel::Throttle3;
+        case compute_throttle_utils::ThrottleLevel::LEVEL_4: return compact::ThrottleLevel::Throttle4;
+        case compute_throttle_utils::ThrottleLevel::LEVEL_5: return compact::ThrottleLevel::Throttle5;
+        default: return std::nullopt;
+    }
+}
+
 std::optional<compact::TensorDescriptor> compact_tensor(const TensorRequest& tensor) noexcept {
     const auto dtype = compact_dtype(tensor.dtype);
     const auto layout = compact_layout(tensor.layout);
@@ -135,7 +158,7 @@ std::optional<tt::tt_metal::Tile> transpose_matmul_tile(const tt::tt_metal::Tile
 }
 
 bool metadata_supports_direct_bank(const compact::TableMetadata& metadata, const bool has_exact_entries) noexcept {
-    if (metadata.lock_schema_version != 2 || metadata.key_schema_version != 1) {
+    if (metadata.lock_schema_version != 2 || metadata.key_schema_version != compact::kKeySchemaVersion) {
         return false;
     }
     if (has_exact_entries && metadata.exact_recipe_evidence_schema_version != 2) {
@@ -188,7 +211,16 @@ Resolution resolve_from_tables(
     if (exact != nullptr) {
         const compact::ProgramConfigCandidate candidate{
             .program_config = exact->program_config, .compute_kernel_config = exact->compute_kernel_config};
-        if (!compact::legal_program_config_candidate(*key, candidate)) {
+        // The lookup already proved the entry was measured for this call's
+        // compute configuration, because the key binds it: entry.key equals the
+        // normalized lookup key here, so comparing the entry against its own
+        // key is exactly comparing it against that normalized key, and a caller
+        // spelling an inert knob differently can never be rejected by it. An
+        // entry whose recipe disagrees with its own key is a malformed
+        // artifact, and serving it is exactly the silent numerics substitution
+        // the key exists to prevent, so refuse it rather than apply it.
+        if (!compact::entry_binds_key_compute_kernel(*exact) ||
+            !compact::legal_program_config_candidate(*key, candidate)) {
             return {.reason = ResolutionReason::MaterializationRejected};
         }
         return {
@@ -305,6 +337,69 @@ ResolvedMatmulIoContract resolve_matmul_io_contract(const IoContractRequest& req
         request.optional_output.has_value()};
 }
 
+compact::ComputeKernelDescriptor default_compute_kernel_descriptor(
+    const std::uint32_t architecture,
+    const compact::DataType input_a_dtype,
+    const compact::DataType input_b_dtype,
+    const compact::DataType output_dtype) noexcept {
+    // Mirrors ttnn::prim::create_matmul_attributes(). The registry only ever
+    // resolves calls that supplied neither a program config nor a user core
+    // grid -- preflight still declines both -- so increase_fidelity there
+    // reduces to !are_inputs_low_precision_df here. Everything else is that
+    // function's init_device_compute_kernel_config() call spelled out:
+    // default_approx_mode=false, default_fp32_acc=is_float_32,
+    // default_l1_acc=!is_float_32, and the parameter defaults for
+    // dst_full_sync_en and throttle_level.
+    const auto is_low_precision = [](const compact::DataType dtype) {
+        return dtype == compact::DataType::BFloat8B || dtype == compact::DataType::BFloat4B;
+    };
+    const bool are_inputs_low_precision_df = is_low_precision(input_a_dtype) && is_low_precision(input_b_dtype);
+    auto math_fidelity = are_inputs_low_precision_df ? compact::MathFidelity::LoFi : compact::MathFidelity::HiFi2;
+    const bool are_inputs_32f =
+        input_a_dtype == compact::DataType::Float32 && input_b_dtype == compact::DataType::Float32;
+    if (are_inputs_32f) {
+        // Hardware bug #38306: HiFi4 + fp32_dest_acc_en can produce incorrect
+        // results on Wormhole, so that architecture defaults to HiFi3.
+        const bool is_wormhole = architecture == static_cast<std::uint32_t>(tt::ARCH::WORMHOLE_B0);
+        math_fidelity = is_wormhole ? compact::MathFidelity::HiFi3 : compact::MathFidelity::HiFi4;
+    }
+    const bool is_float_32 = output_dtype == compact::DataType::Float32;
+    return compact::ComputeKernelDescriptor{
+        .math_fidelity = math_fidelity,
+        .throttle_level = compact::ThrottleLevel::NoThrottle,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = is_float_32,
+        .packer_l1_acc = !is_float_32,
+        .dst_full_sync_en = false};
+}
+
+compact::ComputeKernelDescriptor normalize_key_compute_kernel(compact::ComputeKernelDescriptor knobs) noexcept {
+    // math_approx_mode gates one thing: the APPROX define that
+    // set_hlk_math_approx_mode_all_cores() (kernel.cpp:923) compiles into the
+    // SFPU. No admitted call has an SFPU op to configure -- preflight rejects
+    // has_activation, so every admitted key is has_activation=false and every
+    // entry is fused_activation_present=false -- which makes the knob
+    // behaviourally inert across the whole admitted key space. Keying it would
+    // split each measurement into two unreachable halves and buy no
+    // correctness, so the key carries the single normalized spelling whether
+    // the caller named the knob or defaulted into it. The caller's own value is
+    // still never overwritten: the dispatch does not write compute_kernel_config
+    // back when the caller supplied one.
+    //
+    // THIS NORMALIZATION IS SOUND ONLY WHILE has_activation IS REJECTED. If a
+    // fused activation is ever admitted in preflight_v1_eligibility(), an SFPU
+    // op exists, math_approx_mode becomes numerically live, and this line must
+    // be deleted so the knob becomes a real key axis again. The rejection site
+    // carries the matching note, and
+    // compact::entries_permit_math_approx_normalization() fails the build if an
+    // activation-carrying entry is ever emitted against the normalized key.
+    knobs.math_approx_mode = false;
+    // The other five knobs stay strict. Fidelity in particular selects the
+    // number of FPU passes and is the axis that made a LoFi measurement answer
+    // a HiFi2 call.
+    return knobs;
+}
+
 std::optional<compact::KeyDescriptor> compact_registry_key(const MatmulRegistryRequest& request) noexcept {
     const auto input_a = compact_tensor(request.input_a);
     const auto input_b = compact_tensor(request.input_b);
@@ -348,7 +443,15 @@ std::optional<compact::KeyDescriptor> compact_registry_key(const MatmulRegistryR
         .untilize_out = request.untilize_out,
         .domain = *domain,
         .alpha_f32_bits = request.call.alpha_f32_bits.value_or(0),
-        .beta_f32_bits = request.call.beta_f32_bits.value_or(0)};
+        .beta_f32_bits = request.call.beta_f32_bits.value_or(0),
+        // The knobs this call will actually execute with, whether the caller
+        // named them or let TTNN default them, normalized on the one axis that
+        // is provably inert here. A table entry is reachable only from a call
+        // that asked for exactly what the entry was measured with, so
+        // resolution can never move a caller's numerics.
+        .compute_kernel = normalize_key_compute_kernel(request.user_compute_kernel_config.value_or(
+            default_compute_kernel_descriptor(
+                device.architecture, input_a->dtype, input_b->dtype, output->dtype)))};
 }
 
 ResolutionReason preflight_v1_eligibility(const Eligibility& eligibility) noexcept {
@@ -368,9 +471,20 @@ ResolutionReason preflight_v1_eligibility(const Eligibility& eligibility) noexce
     if (eligibility.io_contract_status != IoContractStatus::Resolved) {
         return ResolutionReason::InconsistentIoContract;
     }
-    if (eligibility.has_program_config || eligibility.has_compute_kernel_config || eligibility.has_user_core_grid) {
+    // A caller-supplied program config or core grid is the answer this registry
+    // would otherwise produce, so those two still decline. A caller-supplied
+    // compute kernel config is not: it is bound into the key
+    // (KeyDescriptor::compute_kernel) and the dispatch commits only
+    // program_config in that case, so the caller's configuration is carried
+    // through untouched rather than replaced.
+    if (eligibility.has_program_config || eligibility.has_user_core_grid) {
         return ResolutionReason::ExplicitOverride;
     }
+    // normalize_key_compute_kernel() drops math_approx_mode from the key
+    // because has_activation is rejected here and so no admitted kernel
+    // contains an SFPU op for that knob to configure. Admitting a fused
+    // activation below without removing that normalization would let one
+    // measurement answer calls of both approximate and precise SFPU spellings.
     if (eligibility.has_bias || eligibility.has_activation || eligibility.transpose_a || eligibility.transpose_b ||
         eligibility.has_unsupported_tile_metadata || eligibility.has_optional_output || eligibility.has_output_tile ||
         eligibility.has_global_cb || eligibility.has_sub_device || eligibility.has_bcast_batch ||
@@ -388,7 +502,7 @@ ResolutionReason validate_v1_request_envelope(
     if (preflight != ResolutionReason::CertifiedMatch) {
         return preflight;
     }
-    if (request.schema_version != 1) {
+    if (request.schema_version != compact::kKeySchemaVersion) {
         return ResolutionReason::IncompleteRequest;
     }
     const auto parameter_count =
@@ -402,6 +516,7 @@ ResolutionReason validate_v1_request_envelope(
         request.has_activation != eligibility.has_activation || request.untilize_out != eligibility.untilize_out ||
         request.bcast_batch.has_value() != eligibility.has_bcast_batch ||
         request.run_batched != eligibility.input_b_batched ||
+        request.user_compute_kernel_config.has_value() != eligibility.has_compute_kernel_config ||
         request.has_activation != request.activation_op.has_value() ||
         request.activation_param_count > request.activation_param_f32_bits.size() ||
         (!request.has_activation && request.activation_param_count != 0) || nonzero_padding) {
@@ -529,6 +644,22 @@ std::optional<DeviceComputeKernelConfig> materialize_registry_compute_kernel_con
         .packer_l1_acc = descriptor.packer_l1_acc,
         .dst_full_sync_en = descriptor.dst_full_sync_en,
         .throttle_level = throttle};
+}
+
+std::optional<compact::ComputeKernelDescriptor> compact_compute_kernel_config(
+    const DeviceComputeKernelConfig& config) noexcept {
+    const auto fidelity = compact_math_fidelity(config.math_fidelity);
+    const auto throttle = compact_throttle_level(config.throttle_level);
+    if (!fidelity || !throttle) {
+        return std::nullopt;
+    }
+    return compact::ComputeKernelDescriptor{
+        .math_fidelity = *fidelity,
+        .throttle_level = *throttle,
+        .math_approx_mode = config.math_approx_mode,
+        .fp32_dest_acc_en = config.fp32_dest_acc_en,
+        .packer_l1_acc = config.packer_l1_acc,
+        .dst_full_sync_en = config.dst_full_sync_en};
 }
 
 std::optional<ttnn::prim::MatmulParams> materialize_parameters_for_execution(

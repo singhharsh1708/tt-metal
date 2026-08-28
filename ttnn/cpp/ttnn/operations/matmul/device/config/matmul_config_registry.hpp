@@ -175,7 +175,7 @@ struct DeviceRequest {
 struct MatmulRegistryRequest {
     static constexpr std::size_t kMaxActivationParameters = 8;
 
-    std::uint32_t schema_version = 1;
+    std::uint32_t schema_version = compact::kKeySchemaVersion;
     CallSemantics call;
     WorkloadRequest workload;
     TensorRequest input_a;
@@ -192,6 +192,12 @@ struct MatmulRegistryRequest {
     std::optional<std::uint32_t> activation_op = std::nullopt;
     std::array<std::uint32_t, kMaxActivationParameters> activation_param_f32_bits{};
     std::uint8_t activation_param_count = 0;
+    // The caller's own DeviceComputeKernelConfig, when they supplied one.
+    // Engaged or not, the effective knobs are bound into the lookup key, so a
+    // measurement is only ever reused for a call that asked for the exact
+    // configuration it was measured with. Empty means the call takes TTNN's
+    // defaults, which default_compute_kernel_descriptor() reproduces.
+    std::optional<compact::ComputeKernelDescriptor> user_compute_kernel_config = std::nullopt;
 
     bool operator==(const MatmulRegistryRequest&) const = default;
 };
@@ -211,6 +217,28 @@ RegistryRequestInspection inspect_registry_request(
     bool trace_capture_active);
 
 std::optional<compact::KeyDescriptor> compact_registry_key(const MatmulRegistryRequest& request) noexcept;
+
+// The compute-kernel configuration ttnn::prim::create_matmul_attributes() would
+// hand a caller who supplied none. Mirrors that function for the subset the
+// registry admits, which never carries a program config or a user core grid.
+compact::ComputeKernelDescriptor default_compute_kernel_descriptor(
+    std::uint32_t architecture,
+    compact::DataType input_a_dtype,
+    compact::DataType input_b_dtype,
+    compact::DataType output_dtype) noexcept;
+
+// Drops the compute-kernel axes that are provably inert across the admitted key
+// space, so one measurement is not split into unreachable halves. Today that is
+// math_approx_mode alone, and only because preflight_v1_eligibility() rejects
+// has_activation; see the definition for the full argument and for what must
+// change if a fused activation is ever admitted.
+compact::ComputeKernelDescriptor normalize_key_compute_kernel(compact::ComputeKernelDescriptor knobs) noexcept;
+
+// Inverse of materialize_registry_compute_kernel_config(). Empty when a knob
+// has no compact spelling, which fails the call closed onto the legacy path
+// rather than keying it under a configuration it does not have.
+std::optional<compact::ComputeKernelDescriptor> compact_compute_kernel_config(
+    const DeviceComputeKernelConfig& config) noexcept;
 
 struct Resolution {
     ResolutionReason reason = ResolutionReason::EmptyRegistry;

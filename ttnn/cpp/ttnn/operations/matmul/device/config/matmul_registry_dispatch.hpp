@@ -8,9 +8,11 @@
 
 namespace ttnn::operations::matmul::registry {
 
-// Observe and resolve one public matmul-family call. On a selected hit, the
-// complete registry-owned parameter object replaces `parameters` atomically.
-// Every observation, inspection, or materialization failure leaves it
+// Observe and resolve one public matmul-family call. On a selected hit the
+// registry-owned axes are committed to `parameters`: always program_config, and
+// compute_kernel_config only when the caller supplied none -- a caller-supplied
+// compute kernel config is a lookup key axis and is never overwritten. Every
+// observation, inspection, or materialization failure leaves `parameters`
 // unchanged and returns false.
 bool try_apply_registry_parameters(
     const ttnn::Tensor& input_tensor_a,
