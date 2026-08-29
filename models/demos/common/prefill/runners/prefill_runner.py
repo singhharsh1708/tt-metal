@@ -287,16 +287,20 @@ def _make_socket_metadata_buffer(mesh_device) -> ttnn.Tensor:
     )
 
 
-def _socket_next(h2d_service, metadata_buf) -> tuple:
+def _socket_next(h2d_service, metadata_buf, tokens_out=None) -> tuple:
     """Block on the next producer push: returns (tt_tokens, {slot_id, actual_start, actual_end},
     tt_metadata). The device metadata tensor is returned (not discarded) so it can be propagated into
     the model's per-layer ack send. `metadata_buf` is the caller-owned persistent record buffer the op
-    writes into, so tt_metadata IS that buffer -- do not free it here. Used only by the unbounded
-    request loop (rank 0 input)."""
+    writes into, so tt_metadata IS that buffer -- do not free it here. `tokens_out` is the same idea for
+    the payload: a caller-owned persistent destination (None allocates a fresh tensor per chunk). Used
+    only by the unbounded request loop (rank 0 input)."""
     import torch
 
     tt_tokens, tt_metadata = ttnn.experimental.deepseek_prefill.inbound_socket_service_sync(
-        h2d_service, metadata_size_bytes=METADATA_SIZE_BYTES, metadata_out=metadata_buf
+        h2d_service,
+        metadata_size_bytes=METADATA_SIZE_BYTES,
+        metadata_out=metadata_buf,
+        tokens_out=tokens_out,
     )
     m = ttnn.to_torch(ttnn.get_device_tensors(tt_metadata)[0]).view(torch.int32).flatten()
     return tt_tokens, {"slot_id": int(m[0]), "actual_start": int(m[1]), "actual_end": int(m[2])}, tt_metadata
@@ -349,15 +353,22 @@ def build_d2d_pipeline_endpoints(mesh_device, rank: int, num_ranks: int, chunk_s
     return inbound, outbound
 
 
-def _d2d_recv(inbound, metadata_buf) -> tuple:
-    """Drain the next chunk that landed in the inbound receiver backing into a fresh device tensor and
-    decode the inline metadata. The returned tensor already has the embedding-output sharding, so it
-    feeds runtime.prefill with no reshard. Pairs with the upstream rank's _d2d_send."""
+def _d2d_recv(inbound, metadata_buf, tokens_out=None) -> tuple:
+    """Drain the next chunk that landed in the inbound receiver backing and decode the inline metadata.
+    The returned tensor already has the embedding-output sharding, so it feeds runtime.prefill with no
+    reshard. Pairs with the upstream rank's _d2d_send.
+
+    `tokens_out` is the caller-owned persistent destination (the runtime's claimed traced input); None
+    allocates a fresh tensor per chunk. The receiver backing per-shard spec and that placeholder
+    activation are the same spec by construction -- both [1, 1, chunk_size/sp, d2d_activation_width/tp]
+    bf16 TILE DRAM (activation_global_spec sharded by D2D_MAPPER_CONFIG, vs make_placeholder_activation)
+    -- and the op TT_FATALs on any mismatch, so a layout drift on either side fails loudly on the first
+    chunk rather than corrupting silently."""
     import torch
 
     t0 = time.perf_counter()
     act, metadata_device = ttnn.experimental.deepseek_prefill.inbound_socket_service_sync(
-        inbound, metadata_size_bytes=METADATA_SIZE_BYTES, metadata_out=metadata_buf
+        inbound, metadata_size_bytes=METADATA_SIZE_BYTES, metadata_out=metadata_buf, tokens_out=tokens_out
     )
     m = ttnn.to_torch(ttnn.get_device_tensors(metadata_device)[0]).view(torch.int32).flatten()
     meta = {"slot_id": int(m[0]), "actual_start": int(m[1]), "actual_end": int(m[2])}
@@ -529,21 +540,34 @@ def run_request_loop(
         f"[pp rank {rank}/{num_ranks}] request (unbounded) loop start "
         f"(is_first={cfg.is_first_rank} is_last={cfg.is_last_rank} input={'h2d' if cfg.is_first_rank else 'd2d'})"
     )
+    # Persistent input destination (#52451). Claim the traced forward's input buffer and hand it to the
+    # inbound sync op as its `tokens_out=`, so each chunk's H2D (first rank) or D2D (every other rank)
+    # drain lands directly on the address the trace captured. That drops both the op's per-chunk
+    # allocation and the per-chunk full-chunk stage-in copy inside the runtime. None when this runtime
+    # is not tracing (or predates the API) -- the op then allocates per call, exactly as before.
+    _claim = getattr(runtime, "claim_persistent_input", None)
+    persistent_in = _claim() if _claim is not None else None
+    logger.info(
+        f"[pp rank {rank}] input destination = "
+        + ("runtime traced input (persistent, no per-chunk copy)" if persistent_in is not None else "per-chunk alloc")
+    )
     t0 = time.perf_counter()
     c = 0
     first = None
     while not _shutdown:
         _lease_reclaim(d2d_in, d2d_out)
         if cfg.is_first_rank:
-            inp, meta, metadata_device = _socket_next(h2d_service, metadata_buf)  # slot/start/end from producer
+            # slot/start/end from producer
+            inp, meta, metadata_device = _socket_next(h2d_service, metadata_buf, persistent_in)
         else:
-            inp, meta, metadata_device = _d2d_recv(d2d_in, metadata_buf)
+            inp, meta, metadata_device = _d2d_recv(d2d_in, metadata_buf, persistent_in)
         if _is_shutdown_sentinel(meta):
             # End of stream: drop the throwaway payload, hand the sentinel to the next rank so it too
             # unblocks and exits, then fall through to the graceful drain below. The metadata record is
             # the loop-owned persistent buffer (_make_socket_metadata_buffer), so it is NOT freed here.
             logger.info(f"[pp rank {rank}] SHUTDOWN sentinel received after {c} chunks; exiting request loop")
-            ttnn.deallocate(inp)
+            if persistent_in is None:  # a claimed buffer is the runtime's and outlives the loop
+                ttnn.deallocate(inp)
             if d2d_out is not None:
                 _forward_shutdown(d2d_out, rank, hidden_size, d2d_send_md)
             break

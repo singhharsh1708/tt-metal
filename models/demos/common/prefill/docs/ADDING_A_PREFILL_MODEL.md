@@ -140,6 +140,21 @@ class PrefillRuntime:  # structural contract — not a base class you must inher
         globally-dense `seq = request_id * num_layers + layer_idx`); a single-rank LayerAck
         channel carries no payload and can ignore it."""
 
+    # --- OPTIONAL hook — implement only if your runtime captures its chunk forward as a ttnn
+    #     trace. The engine probes for it with getattr and falls back to allocate-per-chunk. ---
+    def claim_persistent_input(self) -> "ttnn.Tensor | None":
+        """Hand the engine the traced forward's own input buffer, or None when not tracing.
+
+        A trace records each kernel's runtime args at capture and re-patches nothing on replay,
+        so the inbound socket sync op cannot allocate its own destination inside one. When you
+        return a buffer here, the engine points that op's `tokens_out=` at it, and the chunk's
+        H2D/D2D drain lands directly on the address the trace captured -- no per-chunk
+        allocation, and no stage-in copy for you to do in prefill_chunk.
+
+        Claiming is a commitment, not a peek: once you hand the buffer over, prefill_chunk must
+        neither copy over it nor free it, because the engine now fills it. Return None (or omit
+        the method) to keep the allocate-per-chunk behaviour, which the engine deallocates."""
+
     # --- OPTIONAL hooks — implement only if your model supports cache migration; the serving loop
     #     never calls them. Keep the heavy table logic in your model's own module (a thin forwarder on
     #     the runtime), not inline here. ---
