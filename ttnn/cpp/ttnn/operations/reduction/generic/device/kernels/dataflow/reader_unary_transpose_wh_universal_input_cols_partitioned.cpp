@@ -25,6 +25,7 @@ void kernel_main() {
     constexpr uint32_t scaler_bits = get_compile_time_arg_val(3);
     constexpr bool use_welford = get_compile_time_arg_val(4) != 0;
     constexpr auto fp32_mode = get_compile_time_arg_val(5) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
+    constexpr uint32_t tiles_per_batch = get_compile_time_arg_val(6);
 
     constexpr uint32_t dfb_id_in0 = tt::CBIndex::c_0;
 
@@ -40,11 +41,17 @@ void kernel_main() {
 
     constexpr uint32_t onetile = 1;
 
+    // A full chunk's reads go out behind a single barrier instead of one barrier per tile, which
+    // would expose the whole read latency on every tile. The host sizes the input CB at two batches
+    // of tiles_per_batch, so a multi-tile reserve is only contiguous while the chunk is exactly that
+    // batch: a row_chunk the host did not predict (the SFPU path shortens it) stays per-tile.
+    constexpr bool batch_reads = row_chunk == tiles_per_batch;
+
     constexpr uint32_t dfb_id_in2 = tt::CBIndex::c_2;
     float scaler_f = __builtin_bit_cast(float, scaler_bits);
     dataflow_kernel_lib::prepare_reduce_scaler<dfb_id_in2, REDUCE_OP, REDUCE_DIM>(scaler_f);
 
-    constexpr auto tensor_args = TensorAccessorArgs<6>();
+    constexpr auto tensor_args = TensorAccessorArgs<7>();
     auto tensor_accessor = TensorAccessor(tensor_args, src_addr);
 
     Noc noc;
@@ -75,15 +82,31 @@ void kernel_main() {
         uint32_t reset_curr_id = curr_id;
         uint32_t reset_w = w;
         uint32_t reset_col_start = col_start_tile_id;
+        // The tail chunk is shorter than a batch, so it keeps the per-tile path.
+        const bool batch_chunk = batch_reads && (chunk_end - i) == row_chunk;
 
         for (uint32_t j = 0; j < Ht; ++j) {
             w = reset_w;
             col_start_tile_id = reset_col_start;
+            if (batch_chunk) {
+                dfb_in0.reserve_back(row_chunk);
+            }
+            uint32_t slot = 0;
             for (uint32_t k = i; k < chunk_end; ++k) {
-                dfb_in0.reserve_back(onetile);
-                noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = curr_id}, {.offset_bytes = 0});
-                noc.async_read_barrier();
-                dfb_in0.push_back(onetile);
+                if (batch_chunk) {
+                    noc.async_read(
+                        tensor_accessor,
+                        dfb_in0,
+                        tile_bytes,
+                        {.page_id = curr_id},
+                        {.offset_bytes = slot * tile_bytes});
+                    ++slot;
+                } else {
+                    dfb_in0.reserve_back(onetile);
+                    noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = curr_id}, {.offset_bytes = 0});
+                    noc.async_read_barrier();
+                    dfb_in0.push_back(onetile);
+                }
 
                 ++w;
 
@@ -95,6 +118,10 @@ void kernel_main() {
                     ++curr_id;
                     ++col_start_tile_id;
                 }
+            }
+            if (batch_chunk) {
+                noc.async_read_barrier();
+                dfb_in0.push_back(row_chunk);
             }
             curr_id = reset_curr_id + (j + 1) * Wt;  // stride in H
         }

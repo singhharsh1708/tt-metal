@@ -40,13 +40,14 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
     // gathering tiles over the NoC. Needs matching shard grid, height and orientation, plus shards
     // that tile the tensor exactly; anything else falls through to the generic path.
     const uint32_t shard_Ht = a.shard_spec().has_value() ? a.shard_spec()->shape[0] / tile_height : 0;
-    const bool use_height_sharding =
-        !rm_path && a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
-        output.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED && a.shard_spec().has_value() &&
-        output.shard_spec().has_value() && a.shard_spec()->grid == output.shard_spec()->grid &&
-        a.shard_spec()->shape[0] == output.shard_spec()->shape[0] &&
-        a.shard_spec()->orientation == output.shard_spec()->orientation &&
-        shard_Ht * a.shard_spec()->grid.num_cores() == NC * Ht;
+    const bool use_height_sharding = !rm_path && a.memory_config().is_l1() && output.memory_config().is_l1() &&
+                                     a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+                                     output.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+                                     a.shard_spec().has_value() && output.shard_spec().has_value() &&
+                                     a.shard_spec()->grid == output.shard_spec()->grid &&
+                                     a.shard_spec()->shape[0] == output.shard_spec()->shape[0] &&
+                                     a.shard_spec()->orientation == output.shard_spec()->orientation &&
+                                     shard_Ht * a.shard_spec()->grid.num_cores() == NC * Ht;
 
     if (rm_path) {
         validate_rm_preconditions(
@@ -157,9 +158,21 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
         });
     }
 
+    // Int32 max/min/sum use the SFPU reduce path; fp32 SUM only for the accurate mean opt-in.
+    const bool is_sfpu_reduce =
+        use_sfpu_reduce_path(a.dtype(), operation_attributes.math_op, operation_attributes.use_sfpu_reduce);
+    const bool use_fpu_negate = operation_attributes.negate && !is_sfpu_reduce;
+
+    // Every core reads its rows whole, so even the smallest core streams rows * Wt tiles.
+    const uint32_t min_rows_per_core = num_rows_per_core_group_2 == 0
+                                           ? num_rows_per_core_group_1
+                                           : std::min(num_rows_per_core_group_1, num_rows_per_core_group_2);
+    const uint32_t reader_tiles_per_batch =
+        rm_path || use_height_sharding ? 1u : reduce_reader_batch(min_rows_per_core * Wt);
+
     uint32_t src0_cb_index = 0;
     uint32_t src1_cb_index = tt::CBIndex::c_1;
-    uint32_t num_input_tiles = 2;
+    uint32_t num_input_tiles = reduce_reader_input_cb_tiles(reader_tiles_per_batch);
     if (rm_path) {
         num_input_tiles = std::max(num_input_tiles, plan.wt_tiles_per_chunk);
     }
@@ -219,11 +232,6 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
     const bool use_post_mul = operation_attributes.post_mul_scaler != 1.0f;
     uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
 
-    // Int32 max/min/sum use the SFPU reduce path; fp32 SUM only for the accurate mean opt-in.
-    const bool is_sfpu_reduce =
-        use_sfpu_reduce_path(a.dtype(), operation_attributes.math_op, operation_attributes.use_sfpu_reduce);
-    const bool use_fpu_negate = operation_attributes.negate && !is_sfpu_reduce;
-
     std::vector<uint32_t> reader_compile_time_args;
     if (rm_path) {
         reader_compile_time_args = build_rm_reader_ct_args(
@@ -232,7 +240,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
         reader_compile_time_args = {
             src0_cb_index, src1_cb_index, CBIndex::c_2, std::bit_cast<uint32_t>(operation_attributes.scaler)};
     } else {
-        reader_compile_time_args = {std::bit_cast<uint32_t>(operation_attributes.scaler)};
+        reader_compile_time_args = {std::bit_cast<uint32_t>(operation_attributes.scaler), reader_tiles_per_batch};
         TensorAccessorArgs(a).append_to(reader_compile_time_args);
     }
 

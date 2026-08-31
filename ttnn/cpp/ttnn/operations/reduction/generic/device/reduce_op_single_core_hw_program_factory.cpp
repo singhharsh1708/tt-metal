@@ -81,8 +81,11 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
 
     ProgramDescriptor desc;
 
+    // One core streams the whole tensor here, so only a tensor smaller than a batch turns it off.
+    const uint32_t reader_tiles_per_batch = reduce_reader_batch(num_tensor_tiles);
+
     uint32_t src0_cb_index = 0;
-    uint32_t num_input_tiles = 2;
+    uint32_t num_input_tiles = reduce_reader_input_cb_tiles(reader_tiles_per_batch);
     desc.cbs.push_back(CBDescriptor{
         .total_size = num_input_tiles * src0_single_tile_size,
         .core_ranges = core_set,
@@ -121,7 +124,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
     const bool use_post_mul = operation_attributes.post_mul_scaler != 1.0f;
     uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
 
-    std::vector<uint32_t> reader_compile_time_args = {std::bit_cast<uint32_t>(scaler)};
+    std::vector<uint32_t> reader_compile_time_args = {std::bit_cast<uint32_t>(scaler), reader_tiles_per_batch};
     TensorAccessorArgs(a).append_to(reader_compile_time_args);
 
     if (operation_attributes.negate) {

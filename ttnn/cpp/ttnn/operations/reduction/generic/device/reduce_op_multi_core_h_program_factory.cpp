@@ -132,6 +132,13 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
 
     ProgramDescriptor desc;
 
+    // The column reader issues a whole chunk of columns behind one barrier, so batching needs a core
+    // that owns a full chunk.
+    const uint32_t min_cols_per_core = num_cols_per_core_group_2 == 0
+                                           ? num_cols_per_core_group_1
+                                           : std::min(num_cols_per_core_group_1, num_cols_per_core_group_2);
+    const uint32_t reader_tiles_per_batch = min_cols_per_core < chunk_size ? 1u : chunk_size;
+
     if (rm_path) {
         constexpr uint32_t cb_rm = CBIndex::c_24;
         // CB pages are per-row (see make_rm_plan); hold 2 slabs worth of rows so the reader can
@@ -211,7 +218,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
             .tensor = &a,
         });
     } else {
-        uint32_t num_input_tiles = use_fpu_negate ? chunk_size : 2;
+        uint32_t num_input_tiles = use_fpu_negate ? chunk_size : reduce_reader_input_cb_tiles(reader_tiles_per_batch);
         desc.cbs.push_back(CBDescriptor{
             .total_size = num_input_tiles * src0_single_tile_size,
             .core_ranges = all_cores,
@@ -419,7 +426,13 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
         reader_desc.defines = {reader_defines.begin(), reader_defines.end()};
     } else {
         std::vector<uint32_t> reader_compile_time_args = {
-            Ht, Wt, HtWt, scaler_bits, /*use_welford=*/0, fp32_sfpu_reduce ? 1u : 0u};
+            Ht,
+            Wt,
+            HtWt,
+            scaler_bits,
+            /*use_welford=*/0,
+            fp32_sfpu_reduce ? 1u : 0u,
+            /*tiles_per_batch=*/reader_tiles_per_batch};
         TensorAccessorArgs(a).append_to(reader_compile_time_args);
 
         // Pass DEST config so reader can compute DEST_AUTO_LIMIT
