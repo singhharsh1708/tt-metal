@@ -97,7 +97,7 @@ ttnn:
     bh_p150b_civ2_viommu: 115
     bh_p300: 60
     bh_quietbox_2: 60
-    # package-and-release: matmul/fused/reduction/moreh tests
+  package_and_release:
     wh_n150: 205
     bh_p150: 205
   e2e:

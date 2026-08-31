@@ -21,6 +21,13 @@ on:
         type: string
         default: ''
         description: "Comma-separated category filter. Keep only entries whose `category` field appears in this list."
+      time-budget-key:
+        required: false
+        type: string
+        default: 'unit'
+        description: "Key under each team in .github/time_budget.yaml to verify against.
+          Pipelines that run this workflow at different frequencies pass different keys so
+          their budgets are tracked separately (e.g. package_and_release vs the nightly unit)."
       enable-llk-asserts:
         required: false
         type: boolean
@@ -50,7 +57,8 @@ jobs:
           python3 .github/scripts/utils/verify_time_budget.py \
             ${{ env.TESTS_YAML_PATH }} \
             ./.github/time_budget.yaml \
-            "unit"
+            "${{ inputs.time-budget-key }}" \
+            --skus "${{ inputs.enabled-skus }}"
       - name: Build test matrix based on enabled SKUs
         id: build-matrix
         run: |

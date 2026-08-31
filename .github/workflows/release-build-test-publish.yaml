@@ -157,6 +157,7 @@ jobs:
       wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
       enabled-skus: wh_n150,bh_p150
       additional_test_categories: ${{ inputs.ops-test-categories }}
+      time-budget-key: package_and_release
 
   # Run-level aggregate of per-job AI summaries from release-demo-tests-impl.
   # expected-jobs is the union of single-host and exabox multihost legs so a

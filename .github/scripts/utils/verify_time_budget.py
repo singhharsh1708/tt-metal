@@ -4,7 +4,7 @@ import sys
 from collections import defaultdict
 
 
-def verify_timeouts(tests_file, time_budget_file, workflow_name, tier=None, max_per_test_timeout=None):
+def verify_timeouts(tests_file, time_budget_file, workflow_name, tier=None, max_per_test_timeout=None, skus=None):
     """
     Verifies that the SUM of all test timeouts for each (Team, SKU) pair in tests_file
     is within the total time budget defined in time_budget_file for the given workflow.
@@ -14,11 +14,16 @@ def verify_timeouts(tests_file, time_budget_file, workflow_name, tier=None, max_
     "unit_tier1"). When `tier` is None the behaviour is unchanged: every SKU entry is
     summed and the budget is looked up under the plain "<workflow_name>" key.
 
+    When `skus` is provided, only entries for those SKUs are summed and verified. This
+    allows to support test files shared by pipelines that enable different subsets
+    of SKUs. When`skus=None`, every SKU in the file is verified.
+
     When `max_per_test_timeout` is provided, every individual SKU timeout in the tests
     file must be <= that limit (minutes). Used by smoke/basic to enforce a per-entry
     ceiling for a given pipeline (e.g. merge_gate).
     """
     budget_workflow = workflow_name if tier is None else f"{workflow_name}_tier{tier}"
+    sku_filter = {s.strip() for s in skus.split(",") if s.strip()} if skus else None
 
     print(f"Loading time budgets from: {time_budget_file}")
     with open(time_budget_file, "r") as f:
@@ -30,6 +35,9 @@ def verify_timeouts(tests_file, time_budget_file, workflow_name, tier=None, max_
 
     if tier is not None:
         print(f"Filtering tests to tier '{tier}'; budgets looked up under workflow key '{budget_workflow}'.")
+
+    if sku_filter is not None:
+        print(f"Filtering tests to SKUs: {', '.join(sorted(sku_filter))}.")
 
     if max_per_test_timeout is not None:
         print(f"Enforcing max per-test timeout of {max_per_test_timeout} min " f"for pipeline '{workflow_name}'.")
@@ -68,6 +76,9 @@ def verify_timeouts(tests_file, time_budget_file, workflow_name, tier=None, max_
             continue
 
         for sku_name, sku_config in test_skus.items():
+            if sku_filter is not None and sku_name not in sku_filter:
+                continue
+
             if not isinstance(sku_config, dict) or "timeout" not in sku_config:
                 print(f"  [ERROR] Validation FAILED! Test '{test_name}', SKU '{sku_name}' is missing 'timeout'.")
                 errors_found = True
@@ -152,7 +163,20 @@ if __name__ == "__main__":
         default=None,
         help="Optional max allowed timeout (minutes) for any individual test SKU entry",
     )
+    parser.add_argument(
+        "--skus",
+        default=None,
+        help="Optional comma-separated SKUs to verify; entries for other SKUs are ignored. "
+        "Defaults to every SKU in the tests file.",
+    )
     args = parser.parse_args()
 
     tier_arg = args.tier.strip() if args.tier and args.tier.strip() else None
-    verify_timeouts(args.tests_file, args.time_budget_file, args.workflow_name, tier_arg, args.max_per_test_timeout)
+    verify_timeouts(
+        args.tests_file,
+        args.time_budget_file,
+        args.workflow_name,
+        tier_arg,
+        args.max_per_test_timeout,
+        args.skus,
+    )
