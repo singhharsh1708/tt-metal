@@ -721,7 +721,7 @@ public:
      */
     void async_full_barrier() const { noc_async_full_barrier(noc_id_); }
 
-#if !defined(ARCH_QUASAR) || defined(NOC_API_V2)
+#if !defined(ARCH_QUASAR) || !defined(NOC_API_V1)
     /**
      * @brief Zeroes a local-L1 destination buffer (overload 1).
      *
