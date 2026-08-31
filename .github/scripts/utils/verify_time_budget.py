@@ -16,7 +16,7 @@ def verify_timeouts(tests_file, time_budget_file, workflow_name, tier=None, max_
 
     When `skus` is provided, only entries for those SKUs are summed and verified. This
     allows to support test files shared by pipelines that enable different subsets
-    of SKUs. When`skus=None`, every SKU in the file is verified.
+    of SKUs. When `skus=None`, every SKU in the file is verified.
 
     When `max_per_test_timeout` is provided, every individual SKU timeout in the tests
     file must be <= that limit (minutes). Used by smoke/basic to enforce a per-entry
