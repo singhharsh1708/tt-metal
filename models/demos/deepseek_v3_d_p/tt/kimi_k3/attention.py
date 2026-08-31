@@ -33,7 +33,8 @@ class K3AttnContext:
     """Everything an attention module needs from the caller for one chunk.
 
     One object rather than eleven keyword arguments, because MLA reads most of it and KDA reads
-    none of it — a KDA layer carries its state on the module, not in the call.
+    almost none of it — a KDA layer carries its state on the module, not in the call. The exception
+    is `kda_valid_mask`: state that is carried forward is exactly state that padding can corrupt.
     """
 
     rope_tensors: Optional[dict] = None
@@ -45,6 +46,12 @@ class K3AttnContext:
     actual_start: Optional[int] = None
     # The traced path's `(slot_id, actual_start, actual_end)` triple of 1-element uint32 tensors.
     metadata: Optional[tuple] = None
+    # `[B, T_local, 1]`, 1.0 on a real token and 0.0 on padding -- so KDA reads ONE thing from this
+    # object after all. A partly filled tile is what every turn but the first looks like in a
+    # multi-turn conversation, and unlike attention (which causality masks) KDA carries state
+    # forward, so pad tokens it cannot see are pad tokens folded into the next turn's history.
+    # None means "the whole tile is real", which is every single-turn caller.
+    kda_valid_mask: Optional[object] = None
 
 
 class K3Attention(Protocol):
@@ -156,7 +163,11 @@ class TtK3KdaAttention:
             raise ValueError(
                 f"KDA layer {self.layer_idx} has no state cache; call bind_state_cache() before the first forward"
             )
-        output, new_state = self.kda.forward(hidden, self._states.read(self.layer_idx, ctx.cache_user_id))
+        output, new_state = self.kda.forward(
+            hidden,
+            self._states.read(self.layer_idx, ctx.cache_user_id),
+            valid_mask=ctx.kda_valid_mask,
+        )
         ttnn.deallocate(hidden)
         self._states.commit(self.layer_idx, new_state, ctx.cache_user_id)
 

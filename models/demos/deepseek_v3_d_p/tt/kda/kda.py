@@ -292,6 +292,7 @@ class ttKDA:
         qkv: ttnn.Tensor,
         convolution_state: ttnn.Tensor,
         sequence: int,
+        valid_len: int | None = None,
     ) -> tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor, ttnn.Tensor]:
         """Run depthwise convolution and emit Q/K/V without post-convolution slices."""
         config = self.config
@@ -314,10 +315,16 @@ class ttKDA:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         else:
+            # The carry is the last `conv_kernel_size - 1` rows. On a padded tile those are pad rows,
+            # so the next chunk would open its convolution window on padding; `valid_len` moves the
+            # slice back to the last REAL row. Host-side offset, which is why this is the single-device
+            # path only: under SP the tail may not even be on this chip (see convolution_halo), and a
+            # captured trace cannot take a per-chunk host scalar.
+            carry_end = sequence if valid_len is None else valid_len
             new_state = ttnn.slice(
                 qkv_row_major,
-                (0, sequence - (config.conv_kernel_size - 1), 0),
-                (qkv_row_major.shape[0], sequence, channels),
+                (0, carry_end - (config.conv_kernel_size - 1), 0),
+                (qkv_row_major.shape[0], carry_end, channels),
             )
             # Retained by real-K3 T=5120 component A/B: 74.36-75.76% faster at direct Q/K/V PCC >=0.999989.
         # Cap blocks at the operation's measured production size while keeping the
@@ -376,8 +383,19 @@ class ttKDA:
         beta: ttnn.Tensor,
         decay_rank: ttnn.Tensor,
         output_gate: ttnn.Tensor,
+        valid_mask: ttnn.Tensor | None = None,
     ) -> _KDAInputs:
-        """Evaluate decay and write gates while preserving the output gate for the epilogue."""
+        """Evaluate decay and write gates while preserving the output gate for the epilogue.
+
+        ``valid_mask`` is ``[B, T_local, 1]``, 1.0 on a real token and 0.0 on padding. Multiplying the
+        decay and beta by it is the whole of the padding fix: the recurrence step is
+        ``state = state*exp(gate) + k (x) (beta*residual)``, so gate 0 makes the decay ``exp(0) == 1``
+        and beta 0 makes the update vanish, leaving a pad step an exact identity on the state.
+        Both broadcast over their trailing dimension, so this is two elementwise multiplies.
+
+        ``k`` is deliberately not masked: it is l2-normalised inside the recurrence, and a zero vector
+        there divides by zero -- the NaN would propagate into the very state beta=0 protects.
+        """
         config, weights = self.config, self.weights
         # Preserve the sigmoid result at the FP32 precision required by chunk preparation.
         beta_for_recurrence = ttnn.sigmoid(
@@ -412,6 +430,14 @@ class ttKDA:
             )
             gate = ttnn.sigmoid(gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             gate = ttnn.multiply(gate, config.gate_lower_bound, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if valid_mask is not None:
+            gate = ttnn.multiply(gate, valid_mask, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=gate.dtype)
+            beta_for_recurrence = ttnn.multiply(
+                beta_for_recurrence,
+                valid_mask,
+                memory_config=KDA_OUTPUT_MEMORY_CONFIG,
+                dtype=beta_for_recurrence.dtype,
+            )
         return _KDAInputs(
             q=q,
             k=k,
@@ -549,6 +575,9 @@ class ttKDA:
         self,
         hidden_states: ttnn.Tensor,
         state: KdaState,
+        *,
+        valid_mask: ttnn.Tensor | None = None,
+        valid_len: int | None = None,
     ) -> tuple[ttnn.Tensor, KdaState]:
         """Run prefill KDA and return replacement logical carries.
 
@@ -556,10 +585,28 @@ class ttKDA:
         ``ttnn.copy`` destination or retained on this layer. The returned output
         is sequence-partitioned along SP and, when TP > 1, reduce-scattered on
         the hidden dimension; TP == 1 returns the full hidden dimension.
+
+        ``valid_mask`` (``[B, T_local, 1]``, 1.0 real / 0.0 pad) marks a partly filled tile, which is
+        what every turn but the first looks like in a multi-turn conversation. Without it the pad
+        tokens are decayed and accumulated into the recurrent carry; measured on the reference, 32 pad
+        tokens are already enough to leave the carry uncorrelated with the truth, because the state is
+        scaled by ``exp(gate)`` per step with ``gate`` in (-5, 0). Omitting it preserves the previous
+        behaviour exactly, for the single-turn callers.
+
+        NOTE: this masks the RECURRENT carry only. The convolution carry is still taken from the tail
+        of the tile by ``_convolve_qkv``/``convolution_halo``, so a padded chunk hands the next chunk a
+        3-row window of pads. That, and the SP scan's assumption that chip order is sequence order,
+        are tracked separately -- both are needed before a padded chunk is fully correct.
         """
         batch, sequence = self._validate_forward(hidden_states, state)
+        if valid_mask is not None:
+            expected = (batch, sequence, 1)
+            if tuple(valid_mask.shape) != expected:
+                raise ValueError(f"valid_mask shape {tuple(valid_mask.shape)} != {expected}")
         projected = self._project_inputs(hidden_states)
-        q, k, v, new_convolution = self._convolve_qkv(projected.qkv, state.convolution, sequence=sequence)
+        q, k, v, new_convolution = self._convolve_qkv(
+            projected.qkv, state.convolution, sequence=sequence, valid_len=valid_len
+        )
         inputs = self._compute_gates(
             q,
             k,
@@ -567,6 +614,7 @@ class ttKDA:
             beta=projected.beta,
             decay_rank=projected.decay_rank,
             output_gate=projected.output_gate,
+            valid_mask=valid_mask,
         )
         output, new_recurrent = self._kda_prefill(inputs, state.recurrent)
         output = self._kda_rms_norm(output, inputs.output_gate)

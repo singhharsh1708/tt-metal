@@ -304,3 +304,128 @@ def test_composed_layer_immutable_state_trace_replay(device: ttnn.Device) -> Non
     assert_bit_identical(eager_result, replayed_output, name="traced layer output")
     for name, expected, actual in zip(("recurrent", "convolution"), input_state_before, input_state_after):
         assert_bit_identical(expected, actual, name=f"traced input {name} state")
+
+
+# ---------------------------------------------------------------------------
+# Padded (multi-turn) prefill
+# ---------------------------------------------------------------------------
+# Single device on purpose: this isolates PADDING from the separate question of SP scan ordering, so a
+# failure here is unambiguously about the mask and not about which chip holds the sequence start.
+
+
+def _padded_forward(
+    layer: ttKDA,
+    hidden: torch.Tensor,
+    state: KdaState,
+    valid_len: int,
+) -> tuple[torch.Tensor, KdaState]:
+    """`_forward` plus the `[B, T, 1]` validity mask, 1.0 real / 0.0 pad."""
+    hidden_tt = ttnn.from_torch(
+        hidden,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=layer.device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    mask = torch.zeros(hidden.shape[0], hidden.shape[1], 1)
+    mask[:, :valid_len] = 1.0
+    mask_tt = ttnn.from_torch(
+        mask,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=layer.device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    with ttnn.manage_config("throw_exception_on_fallback", True):
+        # `valid_mask` defends the recurrent carry; `valid_len` moves the convolution carry back to
+        # the last real row. Both are needed for a padded chunk to hand the next chunk clean state.
+        output, next_state = layer.forward(hidden_tt, state, valid_mask=mask_tt, valid_len=valid_len)
+    return ttnn.to_torch(output), next_state
+
+
+def test_padded_prefill_leaves_the_unpadded_recurrent_state(device: ttnn.Device) -> None:
+    """A half-filled tile must leave the recurrent carry the real tokens alone would have.
+
+    Pads are NOISE, not zeros: zeros are near-neutral in several projections, so a zero-padded tile
+    would let a broken mask still score well.
+
+    Both carries are asserted: `valid_mask` defends the recurrent one and `valid_len` moves the
+    convolution slice back to the last real row. Under SP the convolution half still needs
+    `convolution_halo` to learn the valid length, which is why this test is single-device.
+    """
+    config = make_config()
+    weights = random_weights(config)
+    valid = 32
+    real = torch.randn(1, valid, config.hidden_size, generator=torch.Generator().manual_seed(91)).to(torch.bfloat16)
+    noise = torch.randn(1, 32, config.hidden_size, generator=torch.Generator().manual_seed(92)).to(torch.bfloat16)
+    padded = torch.cat((real, noise), dim=1)
+
+    _, golden_state = kda_forward_reference(real, weights, config)
+
+    layer = ttKDA(device, config, weights)
+    padded_output, next_state = _padded_forward(layer, padded, layer.allocate_state(), valid)
+    actual_recurrent = ttnn.to_torch(next_state.recurrent)
+
+    actual_convolution = ttnn.to_torch(next_state.convolution)
+    golden_convolution = torch.cat(
+        (golden_state.q_convolution, golden_state.k_convolution, golden_state.v_convolution), dim=-1
+    )
+    assert_accurate(golden_state.recurrent, actual_recurrent, name="padded recurrent state", pcc_threshold=0.999)
+    assert_accurate(golden_convolution, actual_convolution, name="padded convolution state", pcc_threshold=0.999)
+    golden_output, _ = kda_forward_reference(real, weights, config)
+    assert_accurate(golden_output, padded_output[:, :valid], name="padded output over real rows", pcc_threshold=0.999)
+
+
+def test_unmasked_padding_corrupts_the_recurrent_state(device: ttnn.Device) -> None:
+    """The same tile WITHOUT the mask must not match -- otherwise the test above proves nothing.
+
+    This is the device-side statement of the defect: today's callers pass no mask, so this is what a
+    multi-turn conversation actually computes.
+    """
+    config = make_config()
+    weights = random_weights(config)
+    valid = 32
+    real = torch.randn(1, valid, config.hidden_size, generator=torch.Generator().manual_seed(91)).to(torch.bfloat16)
+    noise = torch.randn(1, 32, config.hidden_size, generator=torch.Generator().manual_seed(92)).to(torch.bfloat16)
+    padded = torch.cat((real, noise), dim=1)
+
+    _, golden_state = kda_forward_reference(real, weights, config)
+
+    layer = ttKDA(device, config, weights)
+    _, next_state = _forward(layer, padded, layer.allocate_state())
+    leaked = ttnn.to_torch(next_state.recurrent)
+
+    want = golden_state.recurrent.flatten().double()
+    got = leaked.flatten().double()
+    want, got = want - want.mean(), got - got.mean()
+    pcc = (want @ got / (want.norm() * got.norm())).item()
+    assert pcc < 0.9, f"unmasked pad rows left the recurrent state intact (pcc={pcc:.6f}); test is vacuous"
+
+
+def test_two_padded_turns_match_one_unpadded_prefill(device: ttnn.Device) -> None:
+    """The multi-turn invariant on device: two padded turns chained == one unpadded sequence.
+
+    This is the property a conversation depends on: turn 2 must see exactly the history turn 1 really
+    had, not turn 1's history plus its padding. It is also the test that proves the CONVOLUTION carry
+    matters -- turn 1's carry is what opens turn 2's convolution window, so without `valid_len` turn 2
+    starts on three rows of turn 1's padding and this fails even with the recurrent mask correct.
+
+    Turn lengths are tile multiples because a non-tile-aligned sequence is rejected outright
+    (`test_non_tile_aligned_sequence_is_rejected`).
+    """
+    config = make_config()
+    weights = random_weights(config)
+    turn_one = torch.randn(1, 32, config.hidden_size, generator=torch.Generator().manual_seed(11)).to(torch.bfloat16)
+    turn_two = torch.randn(1, 32, config.hidden_size, generator=torch.Generator().manual_seed(12)).to(torch.bfloat16)
+    noise = torch.randn(1, 32, config.hidden_size, generator=torch.Generator().manual_seed(13)).to(torch.bfloat16)
+
+    _, golden_state = kda_forward_reference(torch.cat((turn_one, turn_two), dim=1), weights, config)
+
+    layer = ttKDA(device, config, weights)
+    state = layer.allocate_state()
+    # Each turn arrives as a 64-wide tile with 32 real tokens and 32 pad rows.
+    _, state = _padded_forward(layer, torch.cat((turn_one, noise), dim=1), state, 32)
+    _, state = _padded_forward(layer, torch.cat((turn_two, noise), dim=1), state, 32)
+    actual_recurrent = ttnn.to_torch(state.recurrent)
+
+    assert_accurate(golden_state.recurrent, actual_recurrent, name="two-turn recurrent state", pcc_threshold=0.999)
