@@ -6,7 +6,7 @@
 //   qd=q*exp(G), kl=k*exp(G), kr=k*exp(-G)
 //   Akk=strictly_lower((beta*kl)@kr^T), Aqk=tril(qd@kr^T)
 //   kd=beta*kl, k_dec_t=(kr*exp(G_last))^T, dl=exp(G_last).
-// The existing blocked WY inverse helpers below are reused unchanged.
+// T_inv uses a face-blocked polynomial inverse so large gate magnitudes remain stable.
 
 #include <cstdint>
 #include "api/compute/common.h"
@@ -108,6 +108,25 @@ inline void elementwise_binary(DataflowBuffer& a, DataflowBuffer& b, DataflowBuf
         tile_regs_release();
     }
     o.push_back(n);
+}
+
+// Multiply selected source tiles and publish one output tile.
+inline void multiply_tiles(DataflowBuffer& a, uint32_t a_tile, DataflowBuffer& b, uint32_t b_tile, DataflowBuffer& o) {
+    const uint32_t a_id = a.get_id();
+    const uint32_t b_id = b.get_id();
+    const uint32_t o_id = o.get_id();
+
+    o.reserve_back(1);
+    pack_reconfig_data_format(o_id);
+    reconfig_data_format(a_id, b_id);
+    mul_init(a_id, b_id);
+    tile_regs_acquire();
+    mul_tiles(a_id, b_id, a_tile, b_tile, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, o_id, 0);
+    tile_regs_release();
+    o.push_back(1);
 }
 
 inline void square_tiles(DataflowBuffer& in, DataflowBuffer& o, uint32_t n) {
@@ -250,76 +269,82 @@ inline void multiply_by_column(DataflowBuffer& a, DataflowBuffer& col, DataflowB
     o.push_back(Mt * Nt);
 }
 
-// Copy one source tile into a one-tile output buffer.
-inline void copy_tile_to_buffer(DataflowBuffer& src, uint32_t src_tile, DataflowBuffer& o) {
-    const uint32_t src_id = src.get_id();
-    const uint32_t o_id = o.get_id();
-
-    o.reserve_back(1);
-    pack_reconfig_data_format(o_id);
-    reconfig_data_format_srca(src_id);
-    copy_init(src_id);
-    tile_regs_acquire();
-    copy_tile(src_id, src_tile, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, o_id, 0);
-    tile_regs_release();
-    o.push_back(1);
-}
-
-// Invert (I-N) for a strictly-lower 32x32 N using the exact nilpotent product
-// (I-N)^-1 = (I+N)(I+N^2)(I+N^4)(I+N^8)(I+N^16). Eight tile matmuls replace
-// the masked 16x16 Horner path's thirty full-tile matmuls; the shorter dependency chain is also
-// expected to improve fp32 stability, but that must be validated empirically.
-inline void invert_doubling(
+// Invert both 16x16 diagonal blocks of (I-N) with the degree-four Paterson-Stockmeyer factorization
+// sum(N^i, i=0..15) = (I+N+N^2+N^3)(I+N^4+N^8+N^12), then form the bottom-left block
+// D^-1 N_21 A^-1. Here N is the negated strictly-lower Akk, so (I-N)^-1 is the requested T_inv.
+// The diagonal blocks share every full-tile operation, for eight matmuls total.
+inline void invert_block_ps4(
     DataflowBuffer& negative_strict_lower_akk,
-    uint32_t tile,
     DataflowBuffer& inverse,
     DataflowBuffer& identity,
+    DataflowBuffer& block_masks,
 
     // intermediate
     DataflowBuffer& scratch_0,
     DataflowBuffer& scratch_1,
     DataflowBuffer& scratch_2,
     DataflowBuffer& product) {
-    DataflowBuffer* power = &scratch_0;
-    DataflowBuffer* sum = &scratch_1;
-    DataflowBuffer* next_power = &scratch_2;
+    DataflowBuffer& inner_sum = scratch_0;
+    DataflowBuffer& n2 = scratch_1;
+    DataflowBuffer& n3 = scratch_2;
+    DataflowBuffer& outer_sum = product;
 
-    copy_tile_to_buffer(negative_strict_lower_akk, tile, *power);
-    power->wait_front(1);
-    elementwise_binary<ElementwiseBinaryOp::Add>(identity, *power, *sum, 1);
-    sum->wait_front(1);
-    matmul_blocks<1, 1, 1, false>(*power, *power, *next_power);
-    next_power->wait_front(1);
-    power->pop_front(1);
-    power = next_power;
-    next_power = &scratch_0;
+    multiply_tiles(negative_strict_lower_akk, 0, block_masks, 0, inner_sum);
+    inner_sum.wait_front(1);
+    matmul_blocks<1, 1, 1, false>(inner_sum, inner_sum, n2);
+    n2.wait_front(1);
+    matmul_blocks<1, 1, 1, false>(n2, inner_sum, n3);
+    n3.wait_front(1);
+    matmul_blocks<1, 1, 1, false>(n2, n2, outer_sum);
+    outer_sum.wait_front(1);  // N^4
 
-    for (uint32_t step = 0; step < 4; ++step) {
-        matmul_blocks<1, 1, 1, false>(*power, *sum, product);
-        product.wait_front(1);
-        if (step < 3) {
-            matmul_blocks<1, 1, 1, false>(*power, *power, *next_power);
-            next_power->wait_front(1);
-        }
-        power->pop_front(1);
-        elementwise_binary<ElementwiseBinaryOp::Add>(*sum, product, *power, 1);
-        power->wait_front(1);
-        sum->pop_front(1);
-        product.pop_front(1);
-        if (step < 3) {
-            DataflowBuffer* old_sum = sum;
-            sum = power;
-            power = next_power;
-            next_power = old_sum;
-        } else {
-            sum = power;
-        }
-    }
-    copy_tile_to_buffer(*sum, 0, inverse);
-    sum->pop_front(1);
+    // Build I+N+N^2+N^3 in the depth-two inner_sum ring.
+    elementwise_binary<ElementwiseBinaryOp::Add>(identity, inner_sum, inner_sum, 1);
+    inner_sum.wait_front(2);
+    inner_sum.pop_front(1);
+    elementwise_binary<ElementwiseBinaryOp::Add>(inner_sum, n2, inner_sum, 1);
+    inner_sum.wait_front(2);
+    inner_sum.pop_front(1);
+    elementwise_binary<ElementwiseBinaryOp::Add>(inner_sum, n3, inner_sum, 1);
+    inner_sum.wait_front(2);
+    inner_sum.pop_front(1);
+    n3.pop_front(1);
+
+    // Build I+N^4+N^8+N^12 in the depth-two outer_sum ring.
+    matmul_blocks<1, 1, 1, false>(outer_sum, outer_sum, n3);
+    n3.wait_front(1);  // N^8
+    matmul_blocks<1, 1, 1, false>(n3, outer_sum, n2);
+    n2.wait_front(2);  // N^2 remains at the front; N^12 is at the back.
+    n2.pop_front(1);
+    elementwise_binary<ElementwiseBinaryOp::Add>(identity, outer_sum, outer_sum, 1);
+    outer_sum.wait_front(2);
+    outer_sum.pop_front(1);
+    elementwise_binary<ElementwiseBinaryOp::Add>(outer_sum, n3, outer_sum, 1);
+    outer_sum.wait_front(2);
+    outer_sum.pop_front(1);
+    n3.pop_front(1);
+    elementwise_binary<ElementwiseBinaryOp::Add>(outer_sum, n2, outer_sum, 1);
+    outer_sum.wait_front(2);
+    outer_sum.pop_front(1);
+    n2.pop_front(1);
+
+    // The two diagonal inverses share one physical tile; assemble the inverse bottom-left block.
+    matmul_blocks<1, 1, 1, false>(inner_sum, outer_sum, n3);
+    n3.wait_front(1);
+    inner_sum.pop_front(1);
+    outer_sum.pop_front(1);
+    multiply_tiles(negative_strict_lower_akk, 0, block_masks, 1, n2);
+    n2.wait_front(1);
+    matmul_blocks<1, 1, 1, false>(n3, n2, inner_sum);
+    inner_sum.wait_front(1);
+    n2.pop_front(1);
+    matmul_blocks<1, 1, 1, false>(inner_sum, n3, outer_sum);
+    outer_sum.wait_front(1);
+    inner_sum.pop_front(1);
+    elementwise_binary<ElementwiseBinaryOp::Add>(n3, outer_sum, inverse, 1);
+    n3.pop_front(1);
+    outer_sum.pop_front(1);
+    negative_strict_lower_akk.pop_front(1);
 }
 
 // Transpose a tiled row [1,row_tiles] into a tiled column [row_tiles,1].
@@ -519,7 +544,7 @@ inline void prepare_pairwise_matrices(
     constexpr uint32_t chunk_key_tiles = Ct * Kt;
 
     // Materialize both anchored pairwise products, then release k_beta_pairwise/q_pairwise before
-    // the doubling inverse reuses those CBs as private scratch. Only the masked Aqk is published to
+    // the block inverse reuses those CBs as private scratch. Only the masked Aqk is published to
     // writer-facing intra; publishing the raw matrix creates a second consumer race.
     matmul_blocks<Ct, Kt, Ct, true>(k_beta_pairwise, k_pairwise, akk);
     akk.wait_front(chunk_matrix_tiles);  // raw beta*k_i*k_j*exp(G_i-G_j)
@@ -540,6 +565,7 @@ inline void prepare_t_inv(
     DataflowBuffer& akk,
     DataflowBuffer& causal_mask,
     DataflowBuffer& identity,
+    DataflowBuffer& block_masks,
     DataflowBuffer& t_inv,
 
     // intermediate
@@ -565,16 +591,15 @@ inline void prepare_t_inv(
         lower_akk.pop_front(chunk_matrix_tiles);
     }
 
-    invert_doubling(
+    invert_block_ps4(
         akk,
-        0,
         t_inv,
         identity,
-        /*power_workspace=*/scratch_0,
-        /*sum_workspace=*/scratch_1,
-        /*next_power_workspace=*/scratch_2,
+        block_masks,
+        /*inner_sum_workspace=*/scratch_0,
+        /*power_workspace=*/scratch_1,
+        /*power_product_workspace=*/scratch_2,
         product);
-    akk.pop_front(chunk_matrix_tiles);
 }
 
 template <uint32_t Ct, uint32_t Kt>
@@ -619,6 +644,7 @@ TT_KERNEL void compute(uint32_t work_item_count) {
     DataflowBuffer beta(dfb::beta);
     DataflowBuffer eye(dfb::eye);
     DataflowBuffer tril(dfb::tril);
+    DataflowBuffer block_masks(dfb::block_masks);
     DataflowBuffer ones(dfb::ones);
 
     // Writer-consumed outputs.
@@ -647,6 +673,7 @@ TT_KERNEL void compute(uint32_t work_item_count) {
     compute_kernel_hw_startup(dfb::q, dfb::k, dfb::workspace_3);
     eye.wait_front(chunk_matrix_tiles);
     tril.wait_front(chunk_matrix_tiles);
+    block_masks.wait_front(2);
     ones.wait_front(chunk_matrix_tiles);
 
     for (uint32_t work_item = 0; work_item < work_item_count; ++work_item) {
@@ -705,6 +732,7 @@ TT_KERNEL void compute(uint32_t work_item_count) {
             akk,
             tril,
             eye,
+            block_masks,
             t_inv,
             /*scratch_0=*/workspace_1,
             /*scratch_1=*/workspace_2,

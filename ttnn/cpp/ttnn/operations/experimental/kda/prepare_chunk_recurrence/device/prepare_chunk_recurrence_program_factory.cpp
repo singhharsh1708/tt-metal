@@ -53,6 +53,7 @@ uint32_t prepare_chunk_recurrence_cb_size_bytes(
     add(cc);
     add(cc);
     add(cc);
+    add(2);
     add(ck);
     add(ck);
     add(ck);
@@ -67,7 +68,7 @@ uint32_t prepare_chunk_recurrence_cb_size_bytes(
     add(kc, 2, format(4));
     add(kv);
     add(kv);
-    add(kv);
+    add(std::max(kv, 2U));
     add(scratch);
     add(kv, 2);
     return bytes;
@@ -110,6 +111,7 @@ ttnn::device_operation::ProgramArtifacts PrepareChunkRecurrenceProgramFactory::c
     const m2::DFBSpecName eye_dfb{"eye"};
     const m2::DFBSpecName tril_dfb{"tril"};
     const m2::DFBSpecName ones_dfb{"ones"};
+    const m2::DFBSpecName block_masks_dfb{"block_masks"};
     const m2::DFBSpecName workspace_0_dfb{"workspace_0"};
     const m2::DFBSpecName scan_decay_dfb{"scan_decay"};
     const m2::DFBSpecName centered_inverse_decay_dfb{"centered_inverse_decay"};
@@ -164,6 +166,7 @@ ttnn::device_operation::ProgramArtifacts PrepareChunkRecurrenceProgramFactory::c
         make_dfb(eye_dfb, cc, fp32),
         make_dfb(tril_dfb, cc, fp32),
         make_dfb(ones_dfb, cc, fp32),
+        make_dfb(block_masks_dfb, 2, fp32),
         make_dfb(workspace_0_dfb, ck, fp32),
         make_dfb(scan_decay_dfb, ck, fp32),
         make_dfb(centered_inverse_decay_dfb, ck, fp32),
@@ -178,7 +181,7 @@ ttnn::device_operation::ProgramArtifacts PrepareChunkRecurrenceProgramFactory::c
         make_dfb(k_decay_transposed_dfb, 2 * kc, output_formats[4]),
         make_dfb(anchor_decay_dfb, kv, fp32),
         make_dfb(normalized_q_dfb, kv, fp32),
-        make_dfb(normalized_k_dfb, kv, fp32),
+        make_dfb(normalized_k_dfb, std::max(kv, 2U), fp32),
         make_dfb(workspace_3_dfb, scratch, fp32),
         make_dfb(workspace_2_dfb, kv * 2, fp32),
     };
@@ -209,6 +212,7 @@ ttnn::device_operation::ProgramArtifacts PrepareChunkRecurrenceProgramFactory::c
                 m2::DFBBinding{eye_dfb, "eye", m2::DFBEndpointType::PRODUCER},
                 m2::DFBBinding{tril_dfb, "tril", m2::DFBEndpointType::PRODUCER},
                 m2::DFBBinding{ones_dfb, "ones", m2::DFBEndpointType::PRODUCER},
+                m2::DFBBinding{block_masks_dfb, "block_masks", m2::DFBEndpointType::PRODUCER},
             },
         .tensor_bindings =
             {
@@ -263,6 +267,7 @@ ttnn::device_operation::ProgramArtifacts PrepareChunkRecurrenceProgramFactory::c
     unpack_modes[eye_dfb] = UnpackMode::UnpackToSrc;
     unpack_modes[tril_dfb] = UnpackMode::UnpackToSrc;
     unpack_modes[ones_dfb] = UnpackMode::UnpackToSrc;
+    unpack_modes[block_masks_dfb] = UnpackMode::UnpackToSrc;
     unpack_modes[workspace_0_dfb] = UnpackMode::UnpackToSrc;
     unpack_modes[scan_decay_dfb] = UnpackMode::UnpackToSrc;
     unpack_modes[centered_inverse_decay_dfb] = UnpackMode::UnpackToSrc;
@@ -296,6 +301,7 @@ ttnn::device_operation::ProgramArtifacts PrepareChunkRecurrenceProgramFactory::c
                 m2::DFBBinding{eye_dfb, "eye", m2::DFBEndpointType::CONSUMER},
                 m2::DFBBinding{tril_dfb, "tril", m2::DFBEndpointType::CONSUMER},
                 m2::DFBBinding{ones_dfb, "ones", m2::DFBEndpointType::CONSUMER},
+                m2::DFBBinding{block_masks_dfb, "block_masks", m2::DFBEndpointType::CONSUMER},
                 m2::DFBBinding{workspace_0_dfb, "workspace_0", m2::DFBEndpointType::PRODUCER},
                 m2::DFBBinding{workspace_0_dfb, "workspace_0", m2::DFBEndpointType::CONSUMER},
                 m2::DFBBinding{scan_decay_dfb, "scan_decay", m2::DFBEndpointType::PRODUCER},

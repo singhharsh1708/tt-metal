@@ -31,7 +31,7 @@ OUTPUT_NAMES = ("v_beta", "kd", "q_decay", "intra", "k_dec_t", "final_decay", "t
 
 
 @dataclass(frozen=True)
-class _ProductionCase:
+class _PerformanceCase:
     case_id: str
     num_heads: int
     num_chunks: int
@@ -40,14 +40,19 @@ class _ProductionCase:
     expected_duration_ns: int
 
 
-_PRODUCTION_PERF_MARGIN = 0.05
-_PRODUCTION_CASE = _ProductionCase(
+_PERF_REGRESSION_MARGIN = 0.05
+_REGRESSION_CASE = _PerformanceCase(
     "h2-n4-k32-v64",
     num_heads=2,
     num_chunks=4,
     key_dim=32,
     value_dim=64,
     expected_duration_ns=25_419,
+)
+_PRODUCTION_CASES = (
+    _PerformanceCase("sp1-tp8-h12-n160-k128-v128", 12, 160, 128, 128, 817_486),
+    _PerformanceCase("sp2-tp4-h24-n80-k128-v128", 24, 80, 128, 128, 816_534),
+    _PerformanceCase("sp4-tp2-h48-n40-k128-v128", 48, 40, 128, 128, 816_894),
 )
 
 
@@ -211,9 +216,19 @@ def test_prepare_chunk_recurrence_contract_and_trace(
     ttnn.release_trace(device, trace_id)
 
 
-def _production_host_inputs(*, seed: int) -> tuple[torch.Tensor, ...]:
-    case = _PRODUCTION_CASE
+def _regression_host_inputs(*, seed: int) -> tuple[torch.Tensor, ...]:
+    case = _REGRESSION_CASE
     return _host_inputs(case.num_heads, case.num_chunks, case.key_dim, case.value_dim, seed=seed)
+
+
+def _production_compute_config(device: ttnn.Device) -> ttnn.DeviceComputeKernelConfig:
+    return ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
+    )
 
 
 def _assert_outputs_accurate(
@@ -226,27 +241,65 @@ def _assert_outputs_accurate(
         assert_accurate(expected_output, ttnn.to_torch(actual_tt), name=f"{context} {name}", pcc_threshold=0.999)
 
 
-def test_prepare_chunk_recurrence_production_shape_accuracy(device: ttnn.Device) -> None:
-    case_id = "sp1-tp8-h12-n160-k128-v128"
-    num_heads = 12
-    num_chunks = 160
-    key_dim = 128
-    value_dim = 128
+@pytest.mark.parametrize("case", _PRODUCTION_CASES, ids=lambda case: case.case_id)
+def test_prepare_chunk_recurrence_production_shape_t_inv_accuracy(device: ttnn.Device, case: _PerformanceCase) -> None:
     output_bf16_mask = 0x26
-    host_inputs = _host_inputs(num_heads, num_chunks, key_dim, value_dim, seed=52797)
-    expected = _oracle(host_inputs, num_heads, output_bf16_mask)
+    host_inputs = _host_inputs(case.num_heads, case.num_chunks, case.key_dim, case.value_dim, seed=52797)
+    expected = _oracle(host_inputs, case.num_heads, output_bf16_mask)
     inputs = _device_inputs(host_inputs, device)
 
-    first = _run(inputs, num_heads, output_bf16_mask=output_bf16_mask)
-    second = _run(inputs, num_heads, output_bf16_mask=output_bf16_mask)
-    _assert_outputs_accurate(expected, first, context=case_id)
-    for name, first_output, second_output in zip(OUTPUT_NAMES, first, second, strict=True):
-        assert_bit_identical(ttnn.to_torch(first_output), ttnn.to_torch(second_output), name=f"{case_id} {name} repeat")
+    actual = _run(inputs, case.num_heads, output_bf16_mask=output_bf16_mask)
+    assert_accurate(
+        expected[-1],
+        ttnn.to_torch(actual[-1]),
+        name=f"{case.case_id} t_inv",
+        pcc_threshold=0.999,
+    )
+
+
+def test_prepare_chunk_recurrence_t_inv_at_realistic_gate_magnitudes(device: ttnn.Device) -> None:
+    num_heads = 2
+    num_chunks = 2
+    key_dim = 128
+    value_dim = 128
+    host_inputs = list(_host_inputs(num_heads, num_chunks, key_dim, value_dim, seed=54813))
+    host_inputs[1] = torch.full_like(host_inputs[1], 0.25)
+    host_inputs[3] = torch.full_like(host_inputs[3], -0.01).to(torch.bfloat16).float()
+    host_inputs[4] = torch.full_like(host_inputs[4], 0.5)
+    host_inputs = tuple(host_inputs)
+
+    _, k, _, g, beta = host_inputs
+    k = _reshape_flat(k, num_heads, num_chunks, key_dim).double()
+    g = _reshape_flat(g, num_heads, num_chunks, key_dim).double()
+    beta = beta.double()
+    k = k * torch.rsqrt(k.square().sum(dim=-1, keepdim=True) + 1e-6)
+    cumulative_g = torch.cumsum(g, dim=2)
+    anchor_g = cumulative_g[:, :, -1:].mul(0.5)
+    akk = torch.matmul(
+        beta * k * torch.exp(cumulative_g - anchor_g),
+        (k * torch.exp(anchor_g - cumulative_g)).transpose(-1, -2),
+    )
+    identity = torch.eye(CHUNK_SIZE, dtype=torch.float64).reshape(1, 1, CHUNK_SIZE, CHUNK_SIZE)
+    expected_t_inv = torch.linalg.inv(identity + torch.tril(akk, diagonal=-1)).float()
+    actual_t_inv = ttnn.to_torch(_run(_device_inputs(host_inputs, device), num_heads)[-1])
+    lower_rows, lower_columns = torch.tril_indices(CHUNK_SIZE, CHUNK_SIZE, offset=-1)
+    expected_strict_lower = expected_t_inv[..., lower_rows, lower_columns]
+    actual_strict_lower = actual_t_inv[..., lower_rows, lower_columns]
+
+    assert_accurate(
+        expected_strict_lower,
+        actual_strict_lower,
+        name="t_inv strictly-lower at realistic gate magnitudes",
+        pcc_threshold=0.999,
+    )
+    max_abs = float((expected_strict_lower - actual_strict_lower).abs().max())
+    assert max_abs <= 0.05, f"t_inv strictly-lower max abs error {max_abs:.6f} exceeds 0.05"
 
 
 def test_prepare_chunk_recurrence_is_device_deterministic(device: ttnn.Device) -> None:
-    case = _PRODUCTION_CASE
-    host_inputs = _production_host_inputs(seed=1441)
+    # This node owns exact-value determinism; production-shape nodes own geometry-specific t_inv accuracy.
+    case = _REGRESSION_CASE
+    host_inputs = _regression_host_inputs(seed=1441)
     inputs = _device_inputs(host_inputs, device)
 
     def run() -> tuple[ttnn.Tensor, ...]:
@@ -265,9 +318,9 @@ def test_prepare_chunk_recurrence_is_device_deterministic(device: ttnn.Device) -
 
 
 def test_prepare_chunk_recurrence_cache_hit_rebinds_fresh_tensors(device: ttnn.Device) -> None:
-    case = _PRODUCTION_CASE
-    host_a = _production_host_inputs(seed=1911)
-    host_b = _production_host_inputs(seed=1912)
+    case = _REGRESSION_CASE
+    host_a = _regression_host_inputs(seed=1911)
+    host_b = _regression_host_inputs(seed=1912)
     inputs_a = _device_inputs(host_a, device)
     inputs_b = _device_inputs(host_b, device)
 
@@ -286,8 +339,8 @@ def test_prepare_chunk_recurrence_cache_hit_rebinds_fresh_tensors(device: ttnn.D
 
 
 def test_prepare_chunk_recurrence_default_compute_config_matches_explicit_defaults(device: ttnn.Device) -> None:
-    case = _PRODUCTION_CASE
-    inputs = _device_inputs(_production_host_inputs(seed=817), device)
+    case = _REGRESSION_CASE
+    inputs = _device_inputs(_regression_host_inputs(seed=817), device)
     implicit = _run(inputs, case.num_heads)
     entries = device.num_program_cache_entries()
     explicit_config = ttnn.init_device_compute_kernel_config(
@@ -308,8 +361,8 @@ def test_prepare_chunk_recurrence_default_compute_config_matches_explicit_defaul
 
 
 def test_prepare_chunk_recurrence_precise_math_uses_distinct_accurate_program(device: ttnn.Device) -> None:
-    case = _PRODUCTION_CASE
-    host_inputs = _production_host_inputs(seed=818)
+    case = _REGRESSION_CASE
+    host_inputs = _regression_host_inputs(seed=818)
     inputs = _device_inputs(host_inputs, device)
     approximate = _run(inputs, case.num_heads)
     entries = device.num_program_cache_entries()
@@ -330,8 +383,8 @@ def test_prepare_chunk_recurrence_precise_math_uses_distinct_accurate_program(de
 def test_prepare_chunk_recurrence_rejects_unsupported_compute_config(
     device: ttnn.Device, expect_error: Callable
 ) -> None:
-    case = _PRODUCTION_CASE
-    inputs = _device_inputs(_production_host_inputs(seed=819), device)
+    case = _REGRESSION_CASE
+    inputs = _device_inputs(_regression_host_inputs(seed=819), device)
     unsupported_config = ttnn.types.BlackholeComputeKernelConfig(
         math_fidelity=ttnn.MathFidelity.HiFi4,
         packer_l1_acc=True,
@@ -343,12 +396,12 @@ def test_prepare_chunk_recurrence_rejects_unsupported_compute_config(
 @pytest.mark.requires_host_iommu
 @skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
 @skip_with_watcher("Watcher perturbs kernel timing; perf checks are not meaningful with it enabled.")
-def test_prepare_chunk_recurrence_production_performance(device: ttnn.Device) -> None:
-    case = _PRODUCTION_CASE
+def test_prepare_chunk_recurrence_regression_performance(device: ttnn.Device) -> None:
+    case = _REGRESSION_CASE
     if not ttnn.device.IsProgramRealtimeProfilerActive():
         pytest.fail("Real-time profiler must be active for chunk-recurrence preparation performance checks")
 
-    inputs = _device_inputs(_production_host_inputs(seed=117), device)
+    inputs = _device_inputs(_regression_host_inputs(seed=117), device)
 
     def run() -> list[ttnn.Tensor]:
         return _run(inputs, case.num_heads)
@@ -361,10 +414,45 @@ def test_prepare_chunk_recurrence_production_performance(device: ttnn.Device) ->
         f"chunk-recurrence preparation {case.case_id}: duration={duration_ns:.0f} ns, "
         f"profiler_runtime_id={perf_record['runtime_id']}"
     )
-    upper = case.expected_duration_ns * (1 + _PRODUCTION_PERF_MARGIN)
+    upper = case.expected_duration_ns * (1 + _PERF_REGRESSION_MARGIN)
     assert duration_ns <= upper, (
         f"{case.case_id} duration {duration_ns:.0f} ns exceeds {upper:.0f} ns "
-        f"(reference {case.expected_duration_ns} ns, regression margin {_PRODUCTION_PERF_MARGIN * 100:.0f}%)"
+        f"(reference {case.expected_duration_ns} ns, regression margin {_PERF_REGRESSION_MARGIN * 100:.0f}%)"
+    )
+
+
+@pytest.mark.parametrize("case", _PRODUCTION_CASES, ids=lambda case: case.case_id)
+@pytest.mark.requires_host_iommu
+@skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
+@skip_with_watcher("Watcher perturbs kernel timing; perf checks are not meaningful with it enabled.")
+def test_prepare_chunk_recurrence_production_performance(device: ttnn.Device, case: _PerformanceCase) -> None:
+    if not ttnn.device.IsProgramRealtimeProfilerActive():
+        pytest.fail("Real-time profiler must be active for chunk-recurrence preparation performance checks")
+
+    host_inputs = _host_inputs(case.num_heads, case.num_chunks, case.key_dim, case.value_dim, seed=117)
+    inputs = _device_inputs(host_inputs, device)
+
+    def run() -> list[ttnn.Tensor]:
+        return _run(
+            inputs,
+            case.num_heads,
+            output_bf16_mask=0x26,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=_production_compute_config(device),
+        )
+
+    outputs, perf_record = profile_realtime_program(device, run)
+    duration_ns = perf_record["duration_ns"]
+    assert len(outputs) == 7
+    assert tuple(outputs[0].shape) == (case.num_heads, case.num_chunks, CHUNK_SIZE, case.value_dim)
+    logger.info(
+        f"chunk-recurrence preparation {case.case_id}: duration={duration_ns:.0f} ns, "
+        f"profiler_runtime_id={perf_record['runtime_id']}"
+    )
+    upper = case.expected_duration_ns * (1 + _PERF_REGRESSION_MARGIN)
+    assert duration_ns <= upper, (
+        f"{case.case_id} duration {duration_ns:.0f} ns exceeds {upper:.0f} ns "
+        f"(reference {case.expected_duration_ns} ns, regression margin {_PERF_REGRESSION_MARGIN * 100:.0f}%)"
     )
 
 
