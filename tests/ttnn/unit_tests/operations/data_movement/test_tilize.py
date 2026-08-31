@@ -1060,7 +1060,6 @@ def test_tilize_row_major_to_tiny_tile(device, tensor_shape, shard_layout, tile_
     assert_equal(torch_input, ttnn.to_torch(tt_output))
 
 
-@skip_for_wormhole_b0("LLK for tiny tiles not fully supported on Wormhole B0")
 @pytest.mark.parametrize(
     "tensor_shape, shard_layout",
     [
@@ -1129,7 +1128,9 @@ def test_tilize_retile(device, tensor_shape, shard_layout, input_tile_shape, out
 # The packer destination format must be reconfigured to match the output CB before
 # the tilize phase; without it the dtype conversion is silently skipped and the
 # output tensor carries data in the wrong format.
-@skip_for_wormhole_b0("LLK for tiny tiles not fully supported on Wormhole B0")
+@skip_for_wormhole_b0(
+    "Tiny-to-full retile+dtype-conv still broken on WH-B0 for larger tensors (separate LLK bug, see #52175 comments)"
+)
 @pytest.mark.parametrize(
     "in_dtype, out_dtype, min_pcc",
     [
