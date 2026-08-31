@@ -12,8 +12,20 @@ def causal_depthwise_conv_reference(
     inputs: torch.Tensor,
     weight: torch.Tensor,
     initial_state: torch.Tensor | None = None,
+    *,
+    valid_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply causal depthwise convolution and SiLU with ``[B,W-1,D]`` history."""
+    """Apply causal depthwise convolution and SiLU with ``[B,W-1,D]`` history.
+
+    ``valid_len`` marks the first ``valid_len`` rows of ``inputs`` as real and the rest as padding,
+    for a chunk that is a full tile but only partly filled -- the shape of every turn but the first
+    in a multi-turn conversation. Padding is always a SUFFIX in sequence order, so the only thing it
+    can corrupt is the carry: the history returned to the next chunk is the tail of the window, which
+    without this would be the pad rows. With it, the carry is taken from the last real row, so
+    ``forward([real | pad])`` leaves the same state as ``forward([real])``.
+
+    Outputs at padded positions are left as computed and are not meaningful; the caller discards them.
+    """
     batch, _, channels = inputs.shape
     if weight.ndim != 3 or tuple(weight.shape[:2]) != (channels, 1):
         raise ValueError(f"convolution weight shape {tuple(weight.shape)} incompatible with D={channels}")
@@ -28,7 +40,14 @@ def causal_depthwise_conv_reference(
 
     window = torch.cat((history.float(), inputs.float()), dim=1)
     output = F.conv1d(window.transpose(1, 2), weight.float(), groups=channels).transpose(1, 2)
-    final_state = (window[:, -(kernel - 1) :] if kernel > 1 else window[:, :0]).clone()
+    if valid_len is None:
+        carry_end = window.shape[1]
+    else:
+        if not 0 <= valid_len <= inputs.shape[1]:
+            raise ValueError(f"valid_len {valid_len} outside [0, {inputs.shape[1]}]")
+        # The window is [history | inputs], so the last real row sits at (kernel-1) + valid_len.
+        carry_end = (kernel - 1) + valid_len
+    final_state = (window[:, carry_end - (kernel - 1) : carry_end] if kernel > 1 else window[:, :0]).clone()
     return F.silu(output), final_state
 
 
