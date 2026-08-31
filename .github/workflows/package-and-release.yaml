@@ -59,7 +59,7 @@ env:
   DEFAULT_IGNORE_COMMITS: >-
     72e9419a1be562889e1f008cf3e2db495f9e0aa9
   # Ops unit-test categories every release runs unless a custom selection narrows them.
-  # Adding a new category also declare a timeout in ops_unit_tests.yaml
+  # Adding a new category also requires declaring a timeout in ops_unit_tests.yaml
   DEFAULT_OPS_TEST_CATEGORIES: >-
     matmul,fused,reduction,moreh
 
