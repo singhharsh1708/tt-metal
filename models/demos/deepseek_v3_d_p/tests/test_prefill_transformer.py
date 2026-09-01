@@ -1281,7 +1281,9 @@ MISTRAL4_THRESHOLDS = PrefillTransformerThresholds(
 @pytest.mark.parametrize("is_balanced", [False], ids=["non_balanced"])
 @pytest.mark.parametrize(
     "isl_total, dispatch_buffer_capacity_factor",
-    [(SEQ_LEN_1K, 8), (SEQ_LEN_5K, 8)],
+    # 1k is the wiring smoke row; the 5k row is the production chunk width. main replaced the old
+    # SEQ_LEN_* constants with PREFILL_CHUNK_TOKENS, so the 5k row tracks that rather than a literal.
+    [(1024, 8), (PREFILL_CHUNK_TOKENS, 8)],
     ids=["1k", "5k"],
 )
 # 2 layers is the wiring check; 36 is the model. Nothing between the two tests anything new.
