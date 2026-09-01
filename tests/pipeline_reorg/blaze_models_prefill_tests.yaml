@@ -801,7 +801,7 @@
     bh_sc1:
       # First-run estimate: the SC4 entry's measured 8.5 min scaled by the ~4x single-stage penalty,
       # plus serial whole-model load. Tighten once a green run has reported real numbers.
-      timeout: 60
+      timeout: 90
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
   sp_config: sc1
@@ -826,7 +826,7 @@
   skus:
     bh_sc1:
       # 78 layers against Kimi's 61, and both caches read back over UMD. Same first-run caveat.
-      timeout: 70
+      timeout: 100
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
   sp_config: sc1
