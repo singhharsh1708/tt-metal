@@ -27,6 +27,10 @@ wormhole_b0:
   - tests/ttnn/unit_tests/operations/sdpa/test_mla_prefill.py
   - tests/ttnn/unit_tests/operations/sdpa/test_mla_prefill_v_embedding_space.py
 
+  # width=10529 Welford tree: ~10 min per case (4 cases) on ttsim -- the group's
+  # single largest cost against a 40-minute wall budget (#54860). HW keeps it.
+  - tests/ttnn/unit_tests/operations/reduce/test_reduction.py::test_std_var_wide_low_variance
+
   # Likely OOM killer related failures -- probably need to run these tests serially
   - tests/ttnn/unit_tests/base_functionality/test_reshape.py::test_reshape_oob
 
@@ -50,6 +54,10 @@ blackhole:
   - tests/ttnn/unit_tests/base_functionality/test_to_layout.py::test_to_layout_fp8_input_to_tile
   - tests/ttnn/unit_tests/operations/sdpa/test_sparse_sdpa.py
   - tests/ttnn/unit_tests/operations/sdpa/test_sparse_sdpa_msa.py
+
+  # width=10529 Welford tree: ~10 min per case (4 cases) on ttsim -- the group's
+  # single largest cost against a 40-minute wall budget (#54860). HW keeps it.
+  - tests/ttnn/unit_tests/operations/reduce/test_reduction.py::test_std_var_wide_low_variance
 
   # Likely OOM killer related failures -- probably need to run these tests serially
   - tests/ttnn/unit_tests/base_functionality/test_reshape.py::test_reshape_oob
