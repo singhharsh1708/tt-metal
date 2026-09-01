@@ -1,0 +1,118 @@
+name: SFPU accuracy sweep (ttsim)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytest_args:
+        description: "Extra pytest args (e.g. -k Exp)"
+        type: string
+        default: ""
+
+jobs:
+  sweep:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [blackhole, wormhole]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      TT_METAL_DISABLE_SFPLOADMACRO: "1"
+      CHIP_ARCH: ${{ matrix.arch }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: tt_metal/tt-llk/tests
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tt_metal/tt-llk
+            tt_metal/soc_descriptors
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+
+      - name: Resolve pinned ttsim / sfpi versions
+        id: pins
+        run: |
+          # shellcheck disable=SC1091
+          source ./ttsim-version
+          source ./sfpi-version
+          echo "ttsim=$ttsim_version"   >> "$GITHUB_OUTPUT"
+          echo "sfpi=$sfpi_version"     >> "$GITHUB_OUTPUT"
+          echo "ttsim $ttsim_version / sfpi $sfpi_version"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ttsim
+            ~/.sfpi
+          key: sweep-${{ steps.pins.outputs.ttsim }}-${{ steps.pins.outputs.sfpi }}
+
+      - name: Install python deps
+        run: |
+          python -m pip install --upgrade pip
+          # requirements.txt pins tt-umd/tt-exalens at the hardware versions; the
+          # ttsim path needs tt-exalens >= 0.3.16 (see TTSIM.md), and tt-smi drags
+          # in pyluwen which is not needed for simulator runs. See tt-metal#54854.
+          grep -vE '^(tt-exalens|tt-umd|tt-smi)==' requirements.txt > /tmp/reqs.txt
+          pip install 'tt-exalens>=0.3.16' \
+            --index-url https://pypi.org/simple/ \
+            --extra-index-url https://test.pypi.org/simple/
+          pip install -r /tmp/reqs.txt
+
+      - name: Fetch SFPI toolchain
+        run: |
+          V=${{ steps.pins.outputs.sfpi }}
+          mkdir -p ~/.sfpi
+          if [ ! -x ~/.sfpi/sfpi/compiler/bin/riscv-tt-elf-g++ ]; then
+            gh release download "$V" -R tenstorrent/sfpi \
+              -p "sfpi_${V}_x86_64_debian.txz" -D /tmp --clobber
+            tar -xf "/tmp/sfpi_${V}_x86_64_debian.txz" -C ~/.sfpi
+          fi
+          ln -sfn ~/.sfpi/sfpi sfpi
+          sfpi/compiler/bin/riscv-tt-elf-g++ --version | head -1
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch ttsim and SoC descriptor
+        run: |
+          V=${{ steps.pins.outputs.ttsim }}
+          SO=libttsim_${{ matrix.arch == 'blackhole' && 'bh' || 'wh' }}.so
+          mkdir -p ~/.cache/ttsim
+          [ -f ~/.cache/ttsim/"$SO" ] || \
+            gh release download "v$V" -R tenstorrent/ttsim -p "$SO" -D ~/.cache/ttsim --clobber
+          DESC=${{ matrix.arch == 'blackhole' && 'blackhole_140_arch.yaml' || 'wormhole_b0_80_arch.yaml' }}
+          cp "$GITHUB_WORKSPACE/tt_metal/soc_descriptors/$DESC" ~/.cache/ttsim/soc_descriptor.yaml
+          echo "TT_METAL_SIMULATOR=$HOME/.cache/ttsim/$SO" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run the accuracy sweep
+        working-directory: tt_metal/tt-llk/tests/python_tests
+        run: |
+          python -m pytest --run-simulator -m accuracy -q -p no:cacheprovider \
+            -o log_cli=false --timeout=900 ${{ inputs.pytest_args }}
+
+      - name: Rank the results
+        working-directory: tt_metal/tt-llk/tests/python_tests
+        run: |
+          pip install tabulate >/dev/null
+          python "$GITHUB_WORKSPACE/.github/scripts/rank_accuracy.py" \
+            "accuracy/_csv_output/${{ matrix.arch == 'blackhole' && 'bh' || 'wh' }}" \
+            -n 40 --md /tmp/ranked.md
+          {
+            echo "## ${{ matrix.arch }}"
+            cat /tmp/ranked.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sfpu-accuracy-${{ matrix.arch }}
+          path: |
+            tt_metal/tt-llk/tests/python_tests/accuracy/_csv_output/
+          if-no-files-found: warn
