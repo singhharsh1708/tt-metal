@@ -1195,6 +1195,28 @@ class TestConfig:
 
         pytest.skip()
 
+    # llk_barrier takes ckernel::semaphore::PACK_DONE for arrival and drains it each round, so a driver
+    # that also posts PACK_DONE for its own dataflow would have its token discarded. Only profiler builds
+    # compile the barrier, so this is the one boundary where the two can meet.
+    BARRIER_ARRIVE_SEMAPHORE: ClassVar[str] = "semaphore::PACK_DONE"
+
+    def _reject_barrier_semaphore_clash(self) -> None:
+        source = str(self.test_source_path or self.test_name)
+        if not os.path.isabs(source):
+            base = getattr(TestConfig, "TESTS_WORKING_DIR", Path(__file__).parents[2])
+            source = str(Path(base) / source)
+        try:
+            text = Path(source).read_text()
+        except OSError:
+            return  # generated or out-of-tree driver; nothing to inspect
+        if TestConfig.BARRIER_ARRIVE_SEMAPHORE in text:
+            raise RuntimeError(
+                f"{Path(source).name} posts {TestConfig.BARRIER_ARRIVE_SEMAPHORE} and is being built as a "
+                "profiler test, but llk_barrier uses that semaphore for arrival and drains it every "
+                "round, which would discard this driver's token. Move the driver onto its own "
+                "synchronisation before instrumenting it (see issue #54969)."
+            )
+
     def _kernel_source_include(self) -> str:
         """C++ snippet that pulls in this variant's driver.
 
@@ -1358,6 +1380,7 @@ class TestConfig:
             )
 
         if self.profiler_build == ProfilerBuild.Yes:
+            self._reject_barrier_semaphore_clash()
             OPTIONS_COMPILE += "-DLLK_PROFILER "
 
         if os.environ.get("TT_METAL_DISABLE_SFPLOADMACRO") == "1":

@@ -52,8 +52,9 @@ constexpr bool is_action_thread()
 
 #if !defined(ARCH_QUASAR)
 
-// RELEASE has no other user in the LLK. ARRIVE does, in tests that are not instrumented, so the count
-// is drained each round rather than assumed to start at zero (see issue #54969).
+// RELEASE has no other user anywhere. ARRIVE is shared with 11 non-profiler drivers, so the count is
+// drained each round; test_config.py refuses to build any of them as a profiler test, since the drain
+// would discard their token.
 constexpr std::uint8_t ARRIVE_SEM  = ckernel::semaphore::PACK_DONE;
 constexpr std::uint8_t RELEASE_SEM = ckernel::semaphore::UNPACK_OPERAND_SYNC;
 
