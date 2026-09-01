@@ -11,6 +11,7 @@ Runner timing is meaningful only with PREFILL_SYNC_PER_CHUNK=1 (else CHUNK_COMPU
 measured request is the last --real-chunks chunks per rank; any earlier chunks are the discarded warmup.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -157,12 +158,51 @@ def _publish(lines, name):
     print("\n".join(lines))
 
 
+def _publish_json(rec, name):
+    """Persist the metrics as PREFILL_SUMMARIES/perf_json/<name>.json for the cross-config scaling job.
+    The .md block is for humans and is never reparsed; this is the only machine-readable copy.
+
+    Deliberately stdlib-only rather than going through prefill_summary_utils: this runs once from the leg
+    script, not under mpirun, so there is no rank to filter -- and the shared util's module-level loguru
+    import is exactly the kind of dependency that would cost the scaling table on a thin runner."""
+    if not rec or not name:
+        return
+    root = os.environ.get("PREFILL_SUMMARIES")
+    if not root:
+        print("perf metrics not persisted (PREFILL_SUMMARIES unset)")
+        return
+    model, _, config = name.rpartition("_")
+    rec = {"name": name, "model": model or name, "config": config or "unknown", **rec}
+    try:
+        out = os.path.join(root, "perf_json")
+        os.makedirs(out, exist_ok=True)
+        path = os.path.join(out, f"{name}.json")
+        with open(path, "w") as fh:
+            json.dump(rec, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        print(f"perf metrics -> {path}")
+    except OSError as exc:  # a missing sidecar costs the scaling table, not the leg
+        print(f"perf metrics not persisted ({exc})")
+
+
 def _perf_metrics(kept, cs_sorted, disp, chunk_size, win_chunks):
+    """Returns (text block, machine-readable metrics). The dict is what the cross-config scaling
+    comparison consumes; it carries chunk_size/num_chunks so a mismatched pair can be rejected instead
+    of silently divided."""
     n = len(cs_sorted)
     if n == 0:
-        return []
+        return [], {}
     max_seq = n * chunk_size
     ct, ttft = _cell_metrics(kept, disp)
+    rec = {
+        "chunk_size": chunk_size,
+        "num_chunks": n,
+        "max_seq": max_seq,
+        "perf_window_chunks": win_chunks,
+        "chunk_time_ms": {},
+        "ttft_s": {},
+        "throughput_tok_s": {},
+    }
 
     def idx(tok):
         return max(0, min(n - 1, tok // chunk_size))
@@ -179,11 +219,15 @@ def _perf_metrics(kept, cs_sorted, disp, chunk_size, win_chunks):
         d = idx(tok)
         val = f"{ct[d]:>12.3f}" if d in ct else f"{'-':>12}"
         out.append(f"  chunk_time {lbl:>14} (chunk {d:>3}): {val} ms")
+        if d in ct:
+            rec["chunk_time_ms"][lbl] = ct[d]
     out.append("ttft = request start -> chunk finish")
     for lbl, tok in (("@50k", 50000), ("@max_seq/2", max_seq // 2), ("@max_seq", max_seq)):
         d = idx(tok)
         val = f"{ttft[d]:>12.3f}" if d in ttft else f"{'-':>12}"
         out.append(f"  ttft       {lbl:>14} (chunk {d:>3}): {val} s")
+        if d in ttft:
+            rec["ttft_s"][lbl] = ttft[d]
 
     rank0 = min(kept)
     inv = {i: c for c, i in disp.items()}
@@ -203,7 +247,8 @@ def _perf_metrics(kept, cs_sorted, disp, chunk_size, win_chunks):
         dt = sb - sa
         tokens = (d - first) * chunk_size
         out.append(f"  throughput {lbl:>14} ({span}): {tokens / dt:>12,.1f} tok/s  ({dt:.3f} s)")
-    return out
+        rec["throughput_tok_s"][lbl] = tokens / dt
+    return out, rec
 
 
 def _timing_matrix(root, real_chunks, timing_dir=None, chunk_size=0, win_chunks=4):
@@ -214,12 +259,12 @@ def _timing_matrix(root, real_chunks, timing_dir=None, chunk_size=0, win_chunks=
     print("==================== per-rank x per-chunk timing (measured request) ====================")
     if not ranks:
         print("no timing rows found (set PREFILL_SYNC_PER_CHUNK=1 on the runner; timing CSVs / CHUNK_* logs absent)")
-        return []
+        return [], {}
     kept, cs_sorted, disp = _select_measured(ranks, real_chunks)
     all_starts = [c[0] for r in kept.values() for c in r.values() if c[0] is not None]
     if not all_starts:
         print("timing rows present but no compute_start timestamps parsed")
-        return []
+        return [], {}
     t0 = min(all_starts)
     print(f"start/end are seconds relative to the earliest chunk start ({t0:.6f} epoch); ms = device compute time")
     print(f"{'rank':>4}  {'chunk':>5}  {'start_s':>10}  {'end_s':>10}  {'ms':>9}")
@@ -233,7 +278,7 @@ def _timing_matrix(root, real_chunks, timing_dir=None, chunk_size=0, win_chunks=
 
     if chunk_size > 0:
         return _perf_metrics(kept, cs_sorted, disp, chunk_size, win_chunks)
-    return []
+    return [], {}
 
 
 def main():
@@ -251,9 +296,12 @@ def main():
         print(f"ranklogs dir {args.ranklogs} not found; nothing to summarize")
         return
     _pcc_matrix(args.ranklogs)
-    lines = _timing_matrix(args.ranklogs, args.real_chunks, args.timing_dir, args.chunk_size, args.perf_window_chunks)
+    lines, rec = _timing_matrix(
+        args.ranklogs, args.real_chunks, args.timing_dir, args.chunk_size, args.perf_window_chunks
+    )
     if lines:
         _publish(lines, args.summary_name)
+    _publish_json(rec, args.summary_name)
 
 
 if __name__ == "__main__":

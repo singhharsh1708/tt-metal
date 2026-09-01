@@ -316,6 +316,18 @@ jobs:
           fi
           echo "Published ${#files[@]} prefill summary file(s) to the job summary"
 
+      # The machine-readable half of the perf block. The sc1 and sc4 runner legs hold different clusters in
+      # different jobs, so their comparison can only happen at run level -- these are its only input.
+      - name: ⬆️ Upload prefill perf metrics
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: prefill-perf-metrics-${{ inputs.resource-prefix }}-${{ inputs.sp-config }}-${{ strategy.job-index }}
+          path: ${{ env.PREFILL_SUMMARIES }}/perf_json/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+
       # Keep the raw .md files for cross-run perf-trend analysis. Uploaded before cleanup; unique name per
       # matrix job so v7 (no auto-merge) doesn't collide when the whole suite runs.
       - name: ⬆️ Upload prefill summaries
