@@ -628,3 +628,53 @@ def test_concat_fp32_last_dim_mantissa_not_truncated(device, width, layout):
 
     assert tt_output.dtype == ttnn.float32
     assert_equal(torch_output, ttnn.to_torch(tt_output))
+
+
+@pytest.mark.parametrize("layout", [ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT])
+@pytest.mark.parametrize(
+    "shape, num_inputs, dim, strategy, shard_shape, output_shard",
+    [
+        # Issue #51214 item 4: rank-3 HEIGHT_SHARDED width concat used to treat dim=2 as height.
+        ((1, 4, 16), 2, -1, ttnn.ShardStrategy.HEIGHT, (4, 16), (4, 32)),
+        # 3 tensors forces ConcatS2SMultiProgramFactory (2-tensor RM width uses the RM factory).
+        ((1, 4, 16), 3, -1, ttnn.ShardStrategy.HEIGHT, (4, 16), (4, 48)),
+        # Rank-3 height concat on WIDTH_SHARDED (dim == rank-2).
+        ((1, 4, 16), 2, -2, ttnn.ShardStrategy.WIDTH, (4, 16), (8, 16)),
+        # Rank-2 width concat: dim 1 used to miss the s2s factories (hardcoded dim 2/3).
+        ((4, 16), 2, -1, ttnn.ShardStrategy.HEIGHT, (4, 16), (4, 32)),
+        ((4, 16), 3, -1, ttnn.ShardStrategy.HEIGHT, (4, 16), (4, 48)),
+        # Tile-aligned rank-3 so TILE layout actually runs (H/W must be multiples of 32).
+        ((1, 32, 32), 2, -1, ttnn.ShardStrategy.HEIGHT, (32, 32), (32, 64)),
+        ((1, 32, 32), 3, -1, ttnn.ShardStrategy.HEIGHT, (32, 32), (32, 96)),
+        ((1, 32, 32), 2, -2, ttnn.ShardStrategy.WIDTH, (32, 32), (64, 32)),
+    ],
+)
+def test_sharded_concat_rank_relative_dim(device, layout, shape, num_inputs, dim, strategy, shard_shape, output_shard):
+    if layout == ttnn.TILE_LAYOUT and (shape[-2] % 32 != 0 or shape[-1] % 32 != 0):
+        pytest.skip("TILE layout requires tile-aligned H/W")
+
+    shard_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))})
+    input_mem = ttnn.create_sharded_memory_config(
+        shard_shape,
+        core_grid=shard_grid,
+        strategy=strategy,
+        use_height_and_width_as_shard_shape=True,
+    )
+    output_mem = ttnn.create_sharded_memory_config(
+        output_shard,
+        core_grid=shard_grid,
+        strategy=strategy,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+    torch_inputs = [random_torch_tensor(ttnn.bfloat16, shape) for _ in range(num_inputs)]
+    torch_out = torch.concat(torch_inputs, dim=dim)
+
+    ttnn_inputs = []
+    for t in torch_inputs:
+        tt = ttnn.from_torch(t, layout=layout, device=device, dtype=ttnn.bfloat16)
+        ttnn_inputs.append(ttnn.to_memory_config(tt, input_mem))
+
+    ttnn_out = ttnn.concat(ttnn_inputs, dim=dim, memory_config=output_mem)
+    assert tuple(ttnn_out.shape) == tuple(torch_out.shape)
+    assert_equal(torch_out, ttnn.to_torch(ttnn_out))
