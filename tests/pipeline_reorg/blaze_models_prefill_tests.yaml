@@ -735,7 +735,7 @@
     exec bash models/demos/common/prefill/runners/ci/run_multirank_pcc.sh kimi27
   test_type: prefill_runner_kv_pcc
   test_tags: [kimi_k2_7, runner, kv_cache]
-  test_group: module
+  test_group: runner_kv
   skus:
     bh_sc4:
       # Measured test step 8.5 min at 50 chunks; headroom for the up-to-120s producer connect plus
@@ -762,7 +762,7 @@
     exec bash models/demos/common/prefill/runners/ci/run_multirank_pcc.sh glm52
   test_type: prefill_runner_kv_pcc
   test_tags: [glm_5_2, runner, kv_cache]
-  test_group: module
+  test_group: runner_kv
   skus:
     bh_sc4:
       # Measured test step 9 min: weight load from the warm 8x4 cache, then 50 chunks over 78 layers
@@ -772,6 +772,64 @@
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
   sp_config: sc4
+
+
+# ===== Disaggregated prefill, SC1 -- same launcher and same models as the SC4 pair above ===============
+
+# The single-galaxy counterpart of the SC4 pair: identical workflow (background runner publishes the
+# merged KV chunk table, device-less producer feeds it and PCCs every device cache against the same
+# golden trace) with the pipeline collapsed to one stage that owns every layer. Its purpose is the
+# ratio -- SC4 divided by SC1 at a fixed token offset is the pipeline-scaling factor, and that number
+# only means something if both sides run the same request through the same code path.
+#
+# One galaxy runs every layer per chunk instead of a quarter of them, and loads the whole weight set
+# alone instead of a quarter in parallel, so expect roughly 4x the SC4 wall clock. Memory is not the
+# constraint: the full 8x4 weight set plus MLA KV at this depth sits near half of a galaxy's ~1020 GB.
+- name: "(Kimi-K2.7-1T) disaggregated prefill KV accuracy 55k@5k + perf 250k@5k, SC1"
+  cmd: |
+    set -euo pipefail
+    export TT_METAL_HOME="${TT_METAL_HOME:-/home/user/tt-metal}"
+    if [ ! -f "${TT_METAL_HOME}/ttnn/ttnn/distributed/ttrun.py" ]; then
+      cp -rn /ci/tt-metal/. "${TT_METAL_HOME}/"
+    fi
+    cd "${TT_METAL_HOME}"
+    exec bash models/demos/common/prefill/runners/ci/run_multirank_pcc.sh kimi27 sc1
+  test_type: prefill_runner_kv_pcc
+  test_tags: [kimi_k2_7, runner, kv_cache]
+  test_group: runner_kv
+  skus:
+    bh_sc1:
+      # First-run estimate: the SC4 entry's measured 8.5 min scaled by the ~4x single-stage penalty,
+      # plus serial whole-model load. Tighten once a green run has reported real numbers.
+      timeout: 60
+  owner_id: U0AC4LTJH1P # Jaksa Jovicic
+  team: shield
+  sp_config: sc1
+
+
+# GLM-5.2 on one galaxy. Carries the same extra coverage as its SC4 twin -- both device caches
+# (MLA KVPE over all 78 layers + the lightning-indexer KEY cache over the 21 `full` layers) are
+# PCC'd -- but with no layer split, so it is also the control that tells a genuine multi-stage
+# index-cache bug apart from a model-level one.
+- name: "(GLM-5.2-744B) disaggregated prefill KV accuracy 55k@5k + perf 250k@5k, SC1"
+  cmd: |
+    set -euo pipefail
+    export TT_METAL_HOME="${TT_METAL_HOME:-/home/user/tt-metal}"
+    if [ ! -f "${TT_METAL_HOME}/ttnn/ttnn/distributed/ttrun.py" ]; then
+      cp -rn /ci/tt-metal/. "${TT_METAL_HOME}/"
+    fi
+    cd "${TT_METAL_HOME}"
+    exec bash models/demos/common/prefill/runners/ci/run_multirank_pcc.sh glm52 sc1
+  test_type: prefill_runner_kv_pcc
+  test_tags: [glm_5_2, runner, kv_cache]
+  test_group: runner_kv
+  skus:
+    bh_sc1:
+      # 78 layers against Kimi's 61, and both caches read back over UMD. Same first-run caveat.
+      timeout: 70
+  owner_id: U0AC4LTJH1P # Jaksa Jovicic
+  team: shield
+  sp_config: sc1
 
 
 # ===== Op-level, no model under test ===================================================================

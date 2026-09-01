@@ -28,6 +28,12 @@ on:
         required: false
         type: string
         default: ""
+        description: "Comma-separated test_group values to drop, applied after the test-type selection so a group cannot be pulled back in by one of its entries' tags."
+      include-test-group:
+        required: false
+        type: string
+        default: ""
+        description: "Comma-separated test_group values to keep, intersected with the test-type selection. Needed when sp_config alone does not isolate this invocation's legs from another caller's."
       resource-prefix:
         required: true
         type: string
@@ -91,11 +97,10 @@ jobs:
           MATRIX="$MATRIX"
           TEST_TYPE="${{ inputs.test-type }}"
           EXCLUDE_GROUP="${{ inputs.exclude-test-group }}"
+          INCLUDE_GROUP="${{ inputs.include-test-group }}"
           if [ -z "$TEST_TYPE" ] || \
             echo "$TEST_TYPE" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "all"; then
-            if [ -n "$EXCLUDE_GROUP" ]; then
-              MATRIX=$(echo "$MATRIX" | jq -c --arg g "$EXCLUDE_GROUP" '[.[] | select(.test_group != $g)]')
-            fi
+            :
           else
             MATRIX=$(echo "$MATRIX" | jq -c --arg sel "$TEST_TYPE" '
               ($sel | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $tokens
@@ -110,6 +115,30 @@ jobs:
               exit 1
             fi
           fi
+          # Group scoping, applied to both paths rather than only "all". A group is scoped out
+          # because it needs a per-job input this invocation does not carry, so an entry reached
+          # through one of its tags rather than its group must still be dropped -- otherwise it
+          # runs under the wrong job AND a second time under its own caller. INCLUDE_GROUP is the
+          # same rule from the other side, for a caller whose sp_config does not already isolate
+          # it from a sibling that shares the supercluster.
+          #
+          # Emptying the matrix here is not an error. A caller decides whether to fire from the
+          # selection string alone, without being able to read the matrix, so its condition is
+          # necessarily approximate; a caller that fires and finds none of its own legs selected
+          # has nothing to do, which is the benign case. A selection that matches nothing anywhere
+          # is still caught above, where the token filter runs.
+          if [ -n "$EXCLUDE_GROUP" ]; then
+            MATRIX=$(echo "$MATRIX" | jq -c --arg sel "$EXCLUDE_GROUP" '
+              ($sel | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $drop
+              | [ .[] | . as $e | select((($drop | index($e.test_group)) | not)) ]
+            ')
+          fi
+          if [ -n "$INCLUDE_GROUP" ]; then
+            MATRIX=$(echo "$MATRIX" | jq -c --arg sel "$INCLUDE_GROUP" '
+              ($sel | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $keep
+              | [ .[] | . as $e | select($keep | index($e.test_group)) ]
+            ')
+          fi
           echo "filtered_matrix<<EOF" >> $GITHUB_OUTPUT
           echo "$MATRIX" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -121,8 +150,7 @@ jobs:
         run: |
           FILTERED=$(echo "$MATRIX" | jq -c --arg sp "${{ inputs.sp-config }}" '[.[] | select(.sp_config == $sp)]')
           if [ "$FILTERED" = "[]" ]; then
-            echo "::error::No tests found for sp_config '${{ inputs.sp-config }}' in ${TESTS_YAML_PATH}"
-            exit 1
+            echo "::notice::No ${{ inputs.sp-config }} test selected for this invocation; contributing no legs."
           fi
           echo "matrix<<EOF" >> $GITHUB_OUTPUT
           echo "$FILTERED" >> $GITHUB_OUTPUT

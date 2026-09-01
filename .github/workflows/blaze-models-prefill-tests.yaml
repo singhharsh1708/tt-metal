@@ -10,7 +10,8 @@ on:
         description: >-
           Comma-separated stages to run, e.g. "mla_chunked,glm_moe,kimi_moe".
           Empty or "all" runs every stage. Groups: "module" runs every stage,
-          "sdpa_perf" runs ring-joint SDPA and high-bandwidth all-gather.
+          "sdpa_perf" runs ring-joint SDPA and high-bandwidth all-gather,
+          "runner_kv" runs the disaggregated-prefill runner+producer legs on SC1 and SC4.
           Valid stages: dsa_mla_glm, glm_chunked, glm_chunked_accuracy, glm_moe, glm_prefill_block, hca_chunked, hca_perf, high_bw_all_gather_perf, k3_mla, k3_mla_perf, k3_mla_trace, kimi_chunked, kimi_chunked_padded, kimi_dflash, kimi_k3_moe, kimi_moe, kimi_moe_perf, kv_cache_table, minimax_prefill_kv_pcc, minimax_prefill_perf, mla_chunked, moe_gate, prefill_block_determinism, prefill_runner, prefill_runner_kv_pcc, prefill_transformer_determinism, ring_joint_sdpa_perf.
           Tags (each runs every matching stage): block, ccl, determinism, dflash, dsv4_flash, gate, glm_5_2, hca, kimi_k2_6, kimi_k2_7, kimi_k3, kv_cache, minimax_m3, mla, moe, runner, sdpa, transformer.
         required: false
@@ -90,10 +91,12 @@ jobs:
 
   Galaxy-Blaze-models-prefill:
     needs: [validate-test-type, check-harbor, build-artifact]
-    # Skip when only a focused-job stage was requested: sdpa_perf and prefill_runner_kv_pcc
-    # each have their own impl invocation and no sc1 matrix entry, so running the sc1 caller
-    # for them would fail on an empty matrix. "all"/"module" still select this job.
-    if: ${{ needs.validate-test-type.outputs.test-type != 'sdpa_perf' && needs.validate-test-type.outputs.test-type != 'prefill_runner_kv_pcc' }}
+    # Skip when only a focused-job stage was requested: sdpa_perf and the runner legs each have
+    # their own impl invocation, so firing this caller for them leaves an empty matrix once its
+    # exclusions are applied. "all"/"module" still select this job.
+    if: ${{ needs.validate-test-type.outputs.test-type != 'sdpa_perf'
+      && needs.validate-test-type.outputs.test-type != 'prefill_runner_kv_pcc'
+      && needs.validate-test-type.outputs.test-type != 'runner_kv' }}
     permissions:
       id-token: write
       contents: read
@@ -107,13 +110,22 @@ jobs:
       sp-config: sc1
       test-type: ${{ needs.validate-test-type.outputs.test-type }}
       # Keep the perf checks in a focused job so the long functional run remains unchanged.
-      exclude-test-group: sdpa_perf
+      # runner_kv is excluded here rather than left to sp_config: it has sc1 entries now, and its
+      # idling runner needs hang detection off -- a per-job input this invocation does not carry.
+      exclude-test-group: sdpa_perf,runner_kv
       resource-prefix: module
 
   Galaxy-Blaze-models-prefill-SDPA-Perf-tests:
     needs: [validate-test-type, check-harbor, build-artifact]
-    # Runs for the default "all" and when the sdpa_perf group is selected (alone or with others).
-    if: ${{ needs.validate-test-type.outputs.test-type == 'all' || contains(needs.validate-test-type.outputs.test-type, 'sdpa_perf') }}
+    # Runs for the default "all", for the sdpa_perf group, and for any token that selects one of
+    # its entries -- their test_types and tags land here and nowhere else, so a caller that ignored
+    # them would leave those selections with nothing to run.
+    if: ${{ needs.validate-test-type.outputs.test-type == 'all'
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',sdpa_perf,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',ring_joint_sdpa_perf,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',high_bw_all_gather_perf,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',sdpa,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',ccl,') }}
     permissions:
       id-token: write
       contents: read
@@ -125,19 +137,20 @@ jobs:
       wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
       enabled-skus: bh_sc1,bh_sc1_high_power
       sp-config: sc1
-      # Select the perf entry by its test_group so adding more perf checks needs no workflow edit.
+      # Pinned to the group rather than passed through: the selection that fired this caller may be
+      # a tag shared with legs that belong to the module job.
       test-type: sdpa_perf
       resource-prefix: sdpa-perf
 
   Galaxy-Blaze-models-prefill-sc4:
     needs: [validate-test-type, check-harbor, build-artifact]
-    # 4-galaxy (SC4) disaggregated-prefill runner+producer KV-PCC leg. Its own impl
-    # invocation because the impl filters the matrix by sp_config, and this is the only
-    # sc4 entry (the sc1 job's enabled-skus + sp_config filters already exclude it).
-    # Runs for the default "all", for the "module" group, and when its own stage is selected.
-    # Tokens that can select an sc4 entry: its test_type, its test_group, or any of its
-    # test_tags (kimi_k2_7 / glm_5_2 / runner / kv_cache). Firing this caller for a selection
-    # with no sc4 entry fails on an empty matrix, so the list stays exact.
+    # 4-galaxy (SC4) half of the disaggregated-prefill runner+producer KV-PCC pair; the sc1 caller
+    # below is the other half. Each supercluster needs its own impl invocation because the impl
+    # filters the matrix by sp_config, and both need hang detection off, which is a per-job input.
+    # Tokens that can select a runner entry: its test_type, its test_group, or any of its test_tags
+    # (kimi_k2_7 / glm_5_2 / runner / kv_cache). Firing this caller for a selection with no sc4
+    # entry fails on an empty matrix, so the list stays exact. "module" is deliberately absent:
+    # these legs own a supercluster for the better part of an hour and are not module-level work.
     #
     # Each token is comma-wrapped on BOTH sides because contains() is substring-based while the
     # impl's filter matches whole tokens. Without the wrapping, `kv_cache_table` (sc1-only)
@@ -145,7 +158,7 @@ jobs:
     # entry and fails the run -- which is exactly what happened on run 33065088619. The validator
     # emits the selection as ",".join(tokens) with no spaces, so ',<token>,' is an exact match.
     if: ${{ needs.validate-test-type.outputs.test-type == 'all'
-      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',module,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',runner_kv,')
       || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',prefill_runner_kv_pcc,')
       || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',kimi_k2_7,')
       || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',glm_5_2,')
@@ -171,13 +184,51 @@ jobs:
       # never armed the watchdog.
       hang-detection-timeout: 0
 
+  Galaxy-Blaze-models-prefill-sc1-runner:
+    needs: [validate-test-type, check-harbor, build-artifact]
+    # Single-galaxy (SC1) half of the runner+producer KV-PCC pair. Separate from the sc1 module
+    # caller above -- not because of sp_config, which they share, but because the idling runner
+    # needs hang detection off and that is a per-job input. The module caller therefore excludes
+    # runner_kv, and the two never both claim a runner leg.
+    # Selection tokens mirror the sc4 caller exactly; see its comment for the comma-wrapping.
+    if: ${{ needs.validate-test-type.outputs.test-type == 'all'
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',runner_kv,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',prefill_runner_kv_pcc,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',kimi_k2_7,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',glm_5_2,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',runner,')
+      || contains(format(',{0},', needs.validate-test-type.outputs.test-type), ',kv_cache,') }}
+    permissions:
+      id-token: write
+      contents: read
+    secrets: inherit
+    uses: ./.github/workflows/blaze-models-prefill-tests-impl.yaml
+    with:
+      docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
+      build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
+      wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
+      # Base pool only: the runner legs are long enough that the high-power pool would starve
+      # the shorter sc1 module legs that share it.
+      enabled-skus: bh_sc1
+      sp-config: sc1
+      test-type: ${{ needs.validate-test-type.outputs.test-type }}
+      # sp_config cannot isolate this caller from the sc1 module caller above -- they share it --
+      # so the group is named here. Selection still narrows within it: a kimi_k2_7 dispatch runs
+      # the Kimi leg alone, not both.
+      include-test-group: runner_kv
+      resource-prefix: sc1-runner
+      # Same reason as the sc4 caller: the runner idles by design and the watchdog would
+      # triage a healthy run into a wedged fabric.
+      hang-detection-timeout: 0
+
   ai-run-summary:
     name: "AI Run Summary"
     # One run-level summary across both test groups. Each impl invocation
     # uploads its leg matrix as test_matrix_<resource-prefix>; we merge them
     # into expected-jobs so legs that produced no ai_job_summary artifact are
     # reconciled as infra failures rather than silently dropped.
-    needs: [Galaxy-Blaze-models-prefill, Galaxy-Blaze-models-prefill-SDPA-Perf-tests, Galaxy-Blaze-models-prefill-sc4]
+    needs: [Galaxy-Blaze-models-prefill, Galaxy-Blaze-models-prefill-SDPA-Perf-tests,
+      Galaxy-Blaze-models-prefill-sc4, Galaxy-Blaze-models-prefill-sc1-runner]
     # Reports on a run that failed — the case the summary exists for — but not
     # on one that was cancelled: an aborted run has no outcome to summarize, and
     # asking for one spends an LLM call to say it stopped early.
