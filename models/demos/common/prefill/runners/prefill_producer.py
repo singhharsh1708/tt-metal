@@ -656,11 +656,17 @@ def run_schedule(cfg: ProducerConfig, *, push_fn, now_fn=time.perf_counter, slee
         if slot.done:
             completed += 1
             if next_req_id < cfg.max_requests:  # recycle the slot
-                # Multi-turn: resume at the aligned prefix already cached. Align DOWN to 32
-                # (update_padded_kv_cache asserts kv_actual_global % 32 == 0); the <=31 tail tokens are
-                # replayed by this turn's first chunk (PCC-idempotent). Guarded so the default path draws
-                # no extra rng value and the schedule stays bit-identical.
-                prefix = (slot.actual_isl // _KV_CHUNK_TOKENS) * _KV_CHUNK_TOKENS
+                # Multi-turn: resume at the aligned prefix already cached. The tail below the alignment
+                # is replayed by this turn's first chunk (PCC-idempotent). Guarded so the default path
+                # draws no extra rng value and the schedule stays bit-identical.
+                #
+                # The granularity is the MODEL's, not a constant: 32 is the shared floor
+                # (`update_padded_kv_cache` asserts `kv_actual_global % 32 == 0`), but a model with
+                # layers that carry sequential state needs a coarser one, because the offset also
+                # decides which chip holds the sequence start. Kimi-K3 asks for a whole chunk; see
+                # `PrefillModelAdapter.multi_turn_resume_alignment`.
+                align = ADAPTER.multi_turn_resume_alignment(CHUNK_SIZE)
+                prefix = (slot.actual_isl // align) * align
                 if (
                     cfg.multi_turn_prob > 0
                     and prefix + CHUNK_SIZE <= MAX_SEQ_LEN

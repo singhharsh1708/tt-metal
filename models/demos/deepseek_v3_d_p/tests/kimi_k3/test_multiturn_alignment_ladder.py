@@ -114,3 +114,35 @@ def test_every_chunk_covers_its_positions_exactly_once() -> None:
         positions = rotated_chip_positions(resume, SP, CHUNK_LOCAL)
         flat = sorted(p for chip in positions for p in chip)
         assert flat == list(range(resume, resume + CHUNK)), f"resume={resume} does not tile its range"
+
+
+def test_kimi_k3_adapter_asks_for_an_alignment_this_ladder_calls_safe() -> None:
+    """The adapter's declared resume granularity must be a rung that actually works.
+
+    This is the join between the table above and what the producer does with it: the producer rounds
+    a resume offset down to `multi_turn_resume_alignment`, so that value has to land somewhere the
+    rotation leaves KDA's device-order composition correct. Asserting it here means a future tightening
+    (to chunk_size // sp, say) cannot be made without the ladder agreeing it is serviceable.
+    """
+    from models.demos.common.prefill.adapter import get_adapter
+
+    align = get_adapter("kimi_k3").multi_turn_resume_alignment(CHUNK)
+    assert align % 32 == 0, f"alignment {align} violates the shared tile floor"
+
+    # Every offset the producer can now produce must be identity-ordered and split-free, which is what
+    # "correct with today's KDA" means. Sampling multiples of the alignment across a long conversation.
+    for turns in range(1, 12):
+        order, split = _layout(turns * align)
+        assert order == list(range(SP)), f"resume={turns * align} is not identity-ordered: {order}"
+        assert split == [], f"resume={turns * align} splits chips {split}"
+
+
+def test_a_merely_tile_aligned_resume_would_not_be_serviceable() -> None:
+    """The negative case, so the test above cannot pass by accident.
+
+    If the adapter ever returned the shared 32, the offsets it produced would include split-chip cases
+    that KDA silently miscomputes. Stated explicitly because that is the failure this whole mechanism
+    exists to prevent, and it has no runtime symptom to catch it later.
+    """
+    bad = [t * 32 for t in range(1, 40) if (t * 32) % CHUNK_LOCAL]
+    assert any(_layout(off)[1] for off in bad), "expected some 32-aligned offsets to split a chip"

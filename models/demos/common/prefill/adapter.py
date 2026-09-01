@@ -142,6 +142,22 @@ class PrefillModelAdapter(ABC):
         """
         return 1
 
+    def multi_turn_resume_alignment(self, chunk_size: int) -> int:
+        """Granularity a multi-turn resume offset must be rounded DOWN to for this model.
+
+        A turn ends wherever it ends, so the next turn resumes mid-chunk. The producer aligns the
+        resume point down to this and replays the remainder in the next turn's first chunk, which is
+        idempotent (the replayed tokens recompute to the same KV).
+
+        32 -- one tile -- is the floor every model shares: `update_padded_kv_cache` asserts
+        `kv_actual_global % 32 == 0`. A model whose layers carry SEQUENTIAL state across the sequence
+        needs more, because a mid-chunk offset also changes which chip holds the sequence start, and a
+        stateful layer's cross-chip composition may assume device order IS sequence order. Such a model
+        overrides this with the granularity at which that assumption still holds. Bigger means more
+        tokens replayed per turn, and nothing else.
+        """
+        return 32
+
     # =====================================================================
     # Glue the engine calls. The adapter is a factory + descriptor only: it says
     # where this model's config / weights live and how to build its runtime. All

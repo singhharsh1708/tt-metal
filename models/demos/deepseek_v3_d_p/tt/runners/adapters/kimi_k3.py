@@ -226,6 +226,30 @@ class KimiK3Adapter(MLAPrefillAdapter):
         """
         return 1 + boundary_layer_idx // KimiK3Config.ATTN_RES_BLOCK_SIZE
 
+    def multi_turn_resume_alignment(self, chunk_size: int) -> int:
+        """A whole chunk, not the shared 32 — because 69 of K3's 93 layers carry sequential state.
+
+        A resume offset decides which chip holds the sequence start. MLA absorbs that: its KV writer
+        rotates the rows so the cache stays contiguous. KDA cannot, because its sequence-parallel
+        combinators (`convolution_halo`, `_distributed_affine_prefix`) compose their carries walking
+        chips in DEVICE INDEX order, and under the rotation that is no longer sequence order.
+
+        `tests/kimi_k3/test_multiturn_alignment_ladder.py` enumerates exactly what survives:
+
+            multiple of chunk_size    identity order, no chip split    correct as written
+            multiple of chunk_size/sp cyclic order, no chip split      needs sequence-order walking
+            merely 32-aligned         cyclic order, ONE chip split     structural, #54962
+
+        A split chip holds two DISJOINT runs of sequence positions, which a single per-chip affine
+        summary cannot represent — so it is not reachable by reordering. Returning `chunk_size` picks
+        the only rung that is correct with today's KDA, at a cost of replaying under one chunk per
+        turn. Tighten to `chunk_size // sp_factor` once the combinators walk in sequence order.
+
+        Nothing asserts any of this: a resume the model cannot serve is silently wrong, not an error.
+        That is the reason this is a declared model property rather than a comment somewhere.
+        """
+        return chunk_size
+
     def load_hf_config(self):
         """The Kimi-K3 config, hand-built rather than loaded through `AutoConfig`.
 
