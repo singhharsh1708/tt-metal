@@ -799,9 +799,8 @@
   test_group: runner_kv
   skus:
     bh_sc1:
-      # First-run estimate: the SC4 entry's measured 8.5 min scaled by the ~4x single-stage penalty,
-      # plus serial whole-model load. Tighten once a green run has reported real numbers.
-      timeout: 90
+      # Measured 21.3 min: 1.84x the SC4 entry, not the 4x a naive stage count suggests.
+      timeout: 40
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
   sp_config: sc1
@@ -825,8 +824,8 @@
   test_group: runner_kv
   skus:
     bh_sc1:
-      # 78 layers against Kimi's 61, and both caches read back over UMD. Same first-run caveat.
-      timeout: 100
+      # Measured 22.4 min: 2.33x the SC4 entry -- 78 layers against Kimi's 61 on one galaxy.
+      timeout: 45
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
   sp_config: sc1

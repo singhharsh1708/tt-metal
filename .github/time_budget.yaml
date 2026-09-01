@@ -187,7 +187,7 @@ shield:
     bh_p150: 60
   demo:
     bh_sc4: 35
-    bh_sc1: 190
+    bh_sc1: 85
 
 scaleout:
   merge_gate:

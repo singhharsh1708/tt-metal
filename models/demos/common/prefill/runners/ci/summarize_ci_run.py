@@ -10,11 +10,11 @@ Each producer rank validates only its own host's layers, so the PCC rows are the
 Runner timing is meaningful only with PREFILL_SYNC_PER_CHUNK=1 (else CHUNK_COMPUTE is never emitted). The
 measured request is the last --real-chunks chunks per rank; any earlier chunks are the discarded warmup.
 """
+
 import argparse
 import json
 import os
 import re
-import sys
 
 _KV = re.compile(r"slot\s+(\d+)\s+layer\s+(\d+)\s+KV PCC:\s+nope=([-\d.]+)\s+pe=([-\d.]+)")
 _INDEX = re.compile(r"slot\s+(\d+)\s+layer\s+(\d+)\s+\(index rank\s+(\d+)\)\s+index PCC:\s+([-\d.]+)")
@@ -141,20 +141,10 @@ def _cell_metrics(kept, disp):
 
 
 def _publish(lines, name):
-    """Print the perf block, and when named also drop it where the CI publish step globs for it."""
-    title = f"disaggregated prefill perf -- {name or 'run'}"
-    if name:
-        home = os.environ.get("TT_METAL_HOME")
-        if home and home not in sys.path:
-            sys.path.insert(0, home)
-        try:
-            from models.demos.deepseek_v3_d_p.utils.prefill_summary_utils import emit_summary
-
-            emit_summary("perf", name, title, lines)
-            return
-        except Exception as exc:  # publishing is a reporting nicety; never lose the block over it
-            print(f"perf summary not published ({exc})")
-    print(title)
+    """Print the perf block to the leg's own log. Deliberately not published as a job-summary file: one
+    leg measures one cluster config, and the reader wants the configs side by side -- that comparison only
+    exists at run level, off the metrics sidecar, so a per-leg block would just be a fragment of it."""
+    print(f"disaggregated prefill perf -- {name or 'run'}")
     print("\n".join(lines))
 
 

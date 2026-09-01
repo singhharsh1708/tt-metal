@@ -6,10 +6,12 @@ Each leg drops a metrics sidecar (summarize_ci_run.py --summary-name <model>_<co
 separate jobs on separate clusters, so this runs at run level over the collected sidecars rather than
 inside either leg. Pairing is by model: <model>_sc1 vs <model>_sc4.
 
-The gain is only a pipeline-scaling number if both sides measured the same request, so a pair whose
-chunk_size or num_chunks disagree is reported as skipped instead of divided. Stdlib only -- this runs on
-a plain ubuntu runner with no tt-metal env.
+This is the only place a leg's perf numbers surface, so a model with just one config present still gets
+its table -- only the gain column is withheld. The gain is a pipeline-scaling number solely when both
+sides measured the same request, so it is also withheld when chunk_size or num_chunks disagree. Stdlib
+only -- this runs on a plain ubuntu runner with no tt-metal env.
 """
+
 import argparse
 import json
 import os
@@ -42,18 +44,18 @@ def _load(root):
     return by_model
 
 
-def _rows(base, ref):
+def _rows(base, ref, gain=True):
     rows = []
     for family, name, unit, lower_better in _FAMILIES:
         for label in sorted(set(base.get(family, {})) | set(ref.get(family, {}))):
             b, r = base.get(family, {}).get(label), ref.get(family, {}).get(label)
             metric = f"{name} {label}"
-            if b is None or r is None or b <= 0 or r <= 0:
-                gain = "-"
+            if not gain or b is None or r is None or b <= 0 or r <= 0:
+                cell = "-"
             else:
-                gain = f"{(b / r) if lower_better else (r / b):.2f}x"
-            fmt = lambda v: "-" if v is None else f"{v:,.3f}"  # noqa: E731
-            rows.append([metric, f"{fmt(b)} {unit}", f"{fmt(r)} {unit}", gain])
+                cell = f"{(b / r) if lower_better else (r / b):.2f}x"
+            fmt = lambda v: "-" if v is None else f"{v:,.3f} {unit}"  # noqa: E731
+            rows.append([metric, fmt(b), fmt(r), cell])
     return rows
 
 
@@ -86,25 +88,25 @@ def main():
         lines.append(f"No metrics sidecars found under {args.metrics_dir}; nothing to compare.")
     for model in sorted(by_model):
         configs = by_model[model]
-        base, ref = configs.get(_BASE), configs.get(_REF)
+        base, ref = configs.get(_BASE) or {}, configs.get(_REF) or {}
         lines.append(f"#### {model}")
         lines.append("")
-        if base is None or ref is None:
-            have = ", ".join(sorted(configs)) or "none"
-            lines.append(f"needs both {_BASE} and {_REF} to compare; this run has: {have}")
+        note = None
+        if not base or not ref:
+            note = f"only {', '.join(sorted(configs))} ran this run; no gain to compute"
+        elif reason := _comparable(base, ref):
+            note = f"{_BASE} and {_REF} measured different requests ({reason}); gain withheld"
+        if note:
+            lines.append(note)
             lines.append("")
-            continue
-        reason = _comparable(base, ref)
-        if reason:
-            lines.append(f"not comparable: {reason}")
-            lines.append("")
-            continue
+        shape = ref or base
         lines.append("```text")
-        lines.append(
-            f"request: {ref['num_chunks']} chunks x {ref['chunk_size']} tok = {ref['max_seq']} tok; "
-            f"gain = how many times better {_REF} is than {_BASE} (ideal pipeline speedup 4x)"
-        )
-        lines += _table(["metric", _BASE, _REF, f"{_REF} gain"], _rows(base, ref))
+        lines.append(f"request: {shape['num_chunks']} chunks x {shape['chunk_size']} tok = {shape['max_seq']} tok")
+        lines.append(f"gain = how many times better {_REF} is than {_BASE}")
+        lines.append("note: chunk_time is one chunk's latency through the whole pipeline, which pipelining does not")
+        lines.append("      shorten -- and a deeper pipeline pays more D2D hops, so <1x there is expected. The win")
+        lines.append("      is in ttft/throughput.")
+        lines += _table(["metric", _BASE, _REF, f"{_REF} gain"], _rows(base, ref, gain=not note))
         lines.append("```")
         lines.append("")
 
