@@ -318,6 +318,19 @@ class SamplingGenerator:
         count_tokens: bool = True,
     ):
         if penalties_on:
+            # Penalties masks are vocab-sharded per device; logits that were
+            # all-gathered to the full vocab (single-user prefill contract)
+            # cannot take them — the kernel dies with an opaque "Invalid
+            # subtile broadcast type". Name the contract violation instead.
+            mask_width = self.tt_penalties.output_mask.shape[-1]
+            if logits.shape[-1] != mask_width:
+                raise ValueError(
+                    f"on-device sampling penalties need vocab-sharded logits "
+                    f"(last dim {mask_width}), got {tuple(logits.shape)} — "
+                    f"gathered full-vocab logits (e.g. the single-user prefill "
+                    f"path) cannot apply penalties; use the batched prefill "
+                    f"path or sample without penalties"
+                )
             logits = self.tt_penalties.apply(logits)
         tt_tokens, tt_log_probs = self.tt_sampling(logits, tt_out_tok=tt_out_tok)
         if penalties_on and count_tokens:
