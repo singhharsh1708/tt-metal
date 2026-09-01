@@ -328,8 +328,8 @@ def _read_device_map(timeout_s: int) -> dict:
 
 def _connect_layer_ack_channel(timeout_s: int):
     """Attach (consumer side) to the runner's per-layer LayerAck channel
-    (/tt_prefill_layer_acks_<service_id>). Returns the channel, or None if it isn't available (only the
-    single-rank runner creates it)."""
+    (/tt_prefill_layer_acks_<service_id>). Returns the channel, or None if it isn't available: the
+    master rank owns the segment, so it exists only once that rank has finished its ack wiring."""
     service_id = os.environ.get("PREFILL_H2D_SERVICE_ID", "ds_prefill")
     shm_name = f"/tt_prefill_layer_acks_{service_id}"
     try:
@@ -1445,8 +1445,8 @@ def main() -> None:
     if cfg.verify and ack_channel is None:
         logger.error(
             "[producer] CHECK_PCC=1 but LayerAck channel missing — UMD read would race the runner's "
-            "prefill (H2D push return ≠ layers done). Set PREFILL_ENABLE_LAYER_ACK=1 on the runner "
-            "(Gate 1 mock defaults this on via run_prefill_migration_gate.sh)."
+            "prefill (H2D push return ≠ layers done). The master rank always owns this channel, so "
+            "either the runner is not up yet or it died before wiring acks."
         )
         sys.exit(1)
     if not cfg.verify:

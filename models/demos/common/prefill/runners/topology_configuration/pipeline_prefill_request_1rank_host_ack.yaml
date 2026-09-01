@@ -1,0 +1,15 @@
+# REQUEST mode (unbounded, H2D-driven), 1 rank — HOST-CALLBACK LAYER-ACK variant of
+# pipeline_prefill_request_1rank.yaml. Exercises the runtime's on_layer_complete callback ->
+# router-ring path with world_size=1 (local ring + counter channel, no MPI): the same wiring
+# multi-rank uses, minus the device D2H record. Unlike the _d2h_ack bindings this one is
+# trace-compatible. Drive with prefill_producer.py on THIS host; its _drain_layer_acks reports
+# N/(chunks*NUM_LAYERS).
+rank_bindings:
+  - {rank: 0, mesh_id: 0, mesh_host_rank: 0, env_overrides: {}}
+mesh_graph_desc_path: tt_metal/fabric/mesh_graph_descriptors/single_bh_galaxy_torus_x_graph_descriptor.textproto
+global_env:
+  PREFILL_FABRIC_MODE: "2d"
+  PREFILL_MAX_SEQ_LEN: "56320"
+  PREFILL_H2D_SERVICE_ID: "ds_prefill"
+  PREFILL_GATE_FALLBACK_MODE: "DEVICE_FP32"
+  LOGURU_LEVEL: "INFO"

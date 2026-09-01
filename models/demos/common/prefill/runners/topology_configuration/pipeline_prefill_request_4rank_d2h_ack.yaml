@@ -23,8 +23,7 @@ global_env:
   PREFILL_MIGRATION_TABLE_QUEUE: "/mig_ep1_table"
   PREFILL_MIGRATION_RESP_QUEUE: "/mig_ep1_resp"
 
-  # D2H layer-ack path. Multi-rank always builds the router; this only switches the completion
-  # source to device records (vs the host on_layer_complete callback). The producer's
-  # _drain_layer_acks is the verdict, and the only consumer this channel can have: the cursor is a
-  # destructive read, so a second reader would split the count.
+  # LAYER_ACK_D2H switches the completion source to device records (vs the host on_layer_complete
+  # callback). The producer's _drain_layer_acks is the verdict, and the only consumer this channel can
+  # have: the cursor is a destructive read, so a second reader would split the count.
   PREFILL_LAYER_ACK_D2H: "1"
