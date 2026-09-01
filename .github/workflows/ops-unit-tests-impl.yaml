@@ -71,9 +71,14 @@ jobs:
         run: |
           matrix='${{ steps.build-matrix.outputs.matrix }}'
           categories='${{ inputs.additional_test_categories }}'
+          raw_categories="$categories"
           # The comparison is exact between commas, strip whitespace first.
           categories="${categories//[[:space:]]/}"
           filtered=$(echo "$matrix" | jq -c --arg cats ",$categories," '[.[] | .category as $c | select($cats | contains(",\($c),"))]')
+          if [[ -n "$raw_categories" && "$filtered" == "[]" ]]; then
+            echo "::error::No ops unit tests matched categories '$raw_categories' for the enabled SKUs."
+            exit 1
+          fi
           {
             echo "matrix<<EOF"
             echo "$filtered"
