@@ -1,0 +1,17 @@
+mesh_descriptors {
+  name: "M0"
+  arch: BLACKHOLE
+  device_topology { dims: [ 8, 4 ] dim_types: [ RING, RING ] }
+  host_topology   { dims: [ 1, 1 ] }
+  channels { count: 2 policy: RELAXED }
+}
+
+# Single galaxy: one mesh instance and no inter-mesh connections, so the runner
+# collapses to one pipeline stage owning all layers.
+graph_descriptors {
+  name: "G0"
+  type: "FABRIC"
+  instances { mesh { mesh_descriptor: "M0" mesh_id: 0 } }
+}
+
+top_level_instance { graph { graph_descriptor: "G0" graph_id: 0 } }

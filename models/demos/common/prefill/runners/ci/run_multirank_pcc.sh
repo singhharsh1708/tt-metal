@@ -2,21 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
-# Multi-galaxy disaggregated prefill cache-accuracy leg: a background N-rank runner opens the mesh, loads
-# the model, warmup-compiles and publishes the merged KV chunk table to shared NFS; a device-less producer
+# Disaggregated prefill cache-accuracy leg: a background N-rank runner opens the mesh, loads the model,
+# warmup-compiles and publishes the merged KV chunk table to shared NFS; a device-less producer
 # then feeds it, reads EVERY device cache the model published back over UMD (a sparse model's indexer key
 # cache as well as its KVPE cache) and PCCs each against the golden trace. The producer exits non-zero on a
 # PCC miss, but under mpirun-ulfm a lost producer daemon can still return 0 with zero caches validated, so
 # the exit code alone is not trusted: the leg is green only when a durable ok=true verdict exists for every
 # producer rank (the PCC gate near the end). Perf/timing are reported but never gate.
 #
-# Usage: run_multirank_pcc.sh <model-key>       # model-key selects a block in the case below
+# Usage: run_multirank_pcc.sh <model-key> [config]      # config: sc4 (default) | sc1
 #
-# Everything outside that case block is model-independent launcher plumbing (host-order derivation, table
-# poll, runner reaping, durable-verdict dump), so a new model is a case entry, not another copy.
+# Rank count is never stated here: it falls out of the mesh-graph descriptor's instance count and the
+# hostfile, and every downstream consumer (producer host order, PCC gate arity) derives from what tt-run
+# discovery actually bound. That is what lets the single- and multi-galaxy legs share this code path.
+#
+# The selectors are independent axes: <config> owns topology and fabric mode, <model-key> owns weights,
+# manifest and golden trace. The descriptor is looked up as <model>_<config>_mgd.textproto because
+# intra-galaxy dim_types are a model property while instance count is a config property. Everything outside
+# the two case blocks is launcher plumbing, so a new model is a case entry, not another copy.
 set -euo pipefail
 
-MODEL="${1:?usage: run_multirank_pcc.sh <model-key>}"
+MODEL="${1:?usage: run_multirank_pcc.sh <model-key> [config]}"
+CONFIG="${2:-sc4}"
 
 : "${TT_METAL_HOME:?TT_METAL_HOME must be set}"
 : "${PREFILL_SUMMARIES:?PREFILL_SUMMARIES must be set by the blaze impl (shared /ci scratch for the KV table)}"
@@ -35,11 +42,21 @@ WARMUP_CHUNKS=10
 PCC_THRESHOLD=0.85
 RUNNER_ENV=""
 PRODUCER_ENV=""
+# Held equal across configs on purpose: the sc4-vs-sc1 perf ratio is only a pipeline-scaling number if the
+# fabric mode is not also varying underneath it.
+FABRIC_MODE=2d
+
+case "${CONFIG}" in
+  sc1|sc4) ;;
+  *)
+    echo "unknown config '${CONFIG}' (expected sc1 or sc4)" >&2
+    exit 2
+    ;;
+esac
 
 case "${MODEL}" in
   kimi27)
     export PIPELINE_DIR="${PREFILL_SUMMARIES/prefill_summaries/prefill_runner_kv}"
-    MGD="${MGD_DIR}/kimi27_mgd.textproto"
     MANIFEST="${MANIFEST_DIR}/kimi27.json"
     RUNNER_ENV="export PREFILL_HF_MODEL=/mnt/models/moonshotai/Kimi-K2_7-Code-dequantized; export PREFILL_USE_TRACE=1; export PREFILL_LAYER_ACK_D2H=1;"
     PRODUCER_ENV="export PREFILL_PRODUCER_MANIFEST='${MANIFEST}';"
@@ -47,8 +64,7 @@ case "${MODEL}" in
   glm52)
     export PIPELINE_DIR="${PREFILL_SUMMARIES/prefill_summaries/glm52_prefill_runner_kv}"
     # LINE/LINE variant: GLM-5.2's MoE all_to_all deadlocks in warmup under the torus fabric modes on
-    # multi-galaxy pipeline prefill, so the descriptor declares no wrap and the fabric mode stays 2d.
-    MGD="${MGD_DIR}/glm52_mgd.textproto"
+    # multi-galaxy pipeline prefill, so its descriptors declare no wrap and the fabric mode stays 2d.
     MANIFEST="${MANIFEST_DIR}/glm52.json"
     # No traced prefill path for glm52 yet, so exercise the D2H layer-ack backend untraced (no
     # PREFILL_USE_TRACE) -- the same ack backend kimi27 runs under trace.
@@ -64,6 +80,9 @@ case "${MODEL}" in
     exit 2
     ;;
 esac
+
+MGD="${MGD_DIR}/${MODEL}_${CONFIG}_mgd.textproto"
+[ -f "${MGD}" ] || { echo "no mesh-graph descriptor for ${MODEL}/${CONFIG} at ${MGD}" >&2; exit 2; }
 
 mkdir -p "${PIPELINE_DIR}"
 TTRUN_DIR="${TTRUN_DIR:-/etc/ttop}"
@@ -90,7 +109,7 @@ RANKLOGS="${MR_DIR}/ranklogs"
 TIMING_DIR="${MR_DIR}/timing"
 mkdir -p "${TIMING_DIR}"
 
-# The runner idles owning the multi-galaxy allocation until the producer's shutdown sentinel; on any early
+# The runner idles owning the mesh allocation until the producer's shutdown sentinel; on any early
 # exit (table-publish timeout, producer failure) it must be reaped or it strands the hardware until the
 # step timeout. Killing ttrun.py tears down the remote ranks with it.
 cleanup() {
@@ -115,20 +134,25 @@ cleanup() {
     python3 "${TT_METAL_HOME}/models/demos/common/prefill/runners/ci/summarize_ci_run.py" \
       --ranklogs "${RANKLOGS}" --timing-dir "${TIMING_DIR}" --real-chunks "${REAL_CHUNKS}" \
       --chunk-size "${CHUNK_SIZE}" --perf-window-chunks "${PERF_WINDOW_CHUNKS:-4}" \
-      --summary-name "${MODEL}" \
+      --summary-name "${MODEL}_${CONFIG}" \
       || echo "summary generation failed (non-fatal)"
-    # Under PREFILL_SUMMARIES rather than generated/test_logs: the blaze impl uploads that root with
-    # archive:false, which yields a direct PNG link on the job-summary page instead of a log zip to unpack.
-    GANTT_DIR="${PREFILL_SUMMARIES}/plots"
-    mkdir -p "${GANTT_DIR}"
-    python3 -c "import matplotlib" 2>/dev/null \
-      || timeout 90 uv pip install --quiet matplotlib 2>/dev/null \
-      || timeout 90 python3 -m pip install --quiet matplotlib 2>/dev/null \
-      || echo "matplotlib install failed (gantt skipped, non-fatal)"
-    python3 "${TT_METAL_HOME}/models/demos/deepseek_v3_d_p/scripts/plot_pipeline_trace.py" \
-      --timing-dir "${TIMING_DIR}" --real-chunks "${REAL_CHUNKS}" \
-      -o "${GANTT_DIR}/${MODEL}_pipeline_gantt.png" \
-      || echo "gantt render failed (non-fatal)"
+    # A gantt of one stage is just the chunk list again, so render only when the run actually pipelined.
+    # Rank count comes from the timing CSVs (one per rank) rather than the config, so the plot follows what
+    # was really bound.
+    if [ "$(find "${TIMING_DIR}" -name '*.csv' 2>/dev/null | wc -l)" -ge 2 ]; then
+      # Under PREFILL_SUMMARIES rather than generated/test_logs: the blaze impl uploads that root with
+      # archive:false, which yields a direct PNG link on the job-summary page instead of a log zip to unpack.
+      GANTT_DIR="${PREFILL_SUMMARIES}/plots"
+      mkdir -p "${GANTT_DIR}"
+      python3 -c "import matplotlib" 2>/dev/null \
+        || timeout 90 uv pip install --quiet matplotlib 2>/dev/null \
+        || timeout 90 python3 -m pip install --quiet matplotlib 2>/dev/null \
+        || echo "matplotlib install failed (gantt skipped, non-fatal)"
+      python3 "${TT_METAL_HOME}/models/demos/deepseek_v3_d_p/scripts/plot_pipeline_trace.py" \
+        --timing-dir "${TIMING_DIR}" --real-chunks "${REAL_CHUNKS}" \
+        -o "${GANTT_DIR}/${MODEL}_pipeline_gantt.png" \
+        || echo "gantt render failed (non-fatal)"
+    fi
   fi
   rm -rf "${MR_DIR}"
 }
@@ -152,7 +176,7 @@ python3 "${TTRUN_PY}" \
     export PYTHONPATH='${TT_METAL_HOME}'; \
     export PYTHONUNBUFFERED=1; \
     export PREFILL_MANIFEST='${MANIFEST}'; \
-    export PREFILL_FABRIC_MODE=2d; \
+    export PREFILL_FABRIC_MODE=${FABRIC_MODE}; \
     export PREFILL_MAX_SEQ_LEN=${MAX_SEQ_LEN}; \
     export PREFILL_SYNC_PER_CHUNK=1; \
     export PREFILL_TIMING_DIR='${TIMING_DIR}'; \
