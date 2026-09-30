@@ -42,6 +42,7 @@ def run_test_chunked_sdpa(
     flexible=False,
     grid_size=None,
     trace=False,
+    sliding_window_size=None,
 ):
     """Run chunked SDPA over paged K/V and compare to PyTorch SDPA.
 
@@ -79,7 +80,12 @@ def run_test_chunked_sdpa(
     V = fa_rand(b, nkv, s, d)
     K_repeated = torch.cat([K[:, i : i + 1, :, :].repeat(1, nh // nkv, 1, 1) for i in range(nkv)], dim=1)  # b, nh, d, S
     V_repeated = torch.cat([V[:, i : i + 1, :, :].repeat(1, nh // nkv, 1, 1) for i in range(nkv)], dim=1)  # b, nh, d, S
-    gt = torch.nn.functional.scaled_dot_product_attention(Q, K_repeated, V_repeated, is_causal=True)
+    if sliding_window_size is None:
+        gt = torch.nn.functional.scaled_dot_product_attention(Q, K_repeated, V_repeated, is_causal=True)
+    else:
+        distance = torch.arange(s)[:, None] - torch.arange(s)[None, :]
+        window_mask = (distance >= 0) & (distance < sliding_window_size)
+        gt = torch.nn.functional.scaled_dot_product_attention(Q, K_repeated, V_repeated, attn_mask=window_mask)
 
     # Print shapes of all inputs along with input names
     logger.debug(f"Q: {Q.shape}")
@@ -156,6 +162,7 @@ def run_test_chunked_sdpa(
             chunk_start_idx_tensor=chunk_start_idx_tensor,
             program_config=program_config,
             compute_kernel_config=compute_kernel_config,
+            sliding_window_size=sliding_window_size,
         )
         # Capture: record one SDPA call
         tid = ttnn.begin_trace_capture(device, cq_id=0)
@@ -167,6 +174,7 @@ def run_test_chunked_sdpa(
             chunk_start_idx_tensor=chunk_start_idx_tensor,
             program_config=program_config,
             compute_kernel_config=compute_kernel_config,
+            sliding_window_size=sliding_window_size,
         )
         ttnn.end_trace_capture(device, tid, cq_id=0)
 
@@ -215,6 +223,7 @@ def run_test_chunked_sdpa(
                     chunk_start_idx_tensor=chunk_start_idx_tensor,
                     program_config=program_config,
                     compute_kernel_config=compute_kernel_config,
+                    sliding_window_size=sliding_window_size,
                 )
             else:
                 ttnn.synchronize_device(device)
@@ -227,6 +236,7 @@ def run_test_chunked_sdpa(
                     chunk_start_idx,
                     program_config=program_config,
                     compute_kernel_config=compute_kernel_config,
+                    sliding_window_size=sliding_window_size,
                 )
             ttnn.synchronize_device(device)
             elapsed = time.perf_counter() - t0
@@ -309,6 +319,29 @@ def test_sdpa_chunked(
         device.num_program_cache_entries() == expected_entries
     ), "Program cache should have {} entry/entries but has {}".format(
         expected_entries, device.num_program_cache_entries()
+    )
+
+
+@pytest.mark.skipif(is_watcher_enabled(), reason="Kernel OOM with watcher enabled")
+@pytest.mark.parametrize("sliding_window_size", [2047, 4096])
+@pytest.mark.parametrize("flexible", [False, True], ids=["legacy", "flexible"])
+def test_sdpa_chunked_sliding_window(device, sliding_window_size, flexible):
+    run_test_chunked_sdpa(
+        device,
+        1,
+        8,
+        1,
+        8 * 1024,
+        128,
+        128,
+        128,
+        2048,
+        64,
+        ttnn.bfloat16,
+        ttnn.bfloat8_b,
+        False,
+        flexible=flexible,
+        sliding_window_size=sliding_window_size,
     )
 
 
