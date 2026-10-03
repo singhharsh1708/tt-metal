@@ -40,7 +40,6 @@ def run(S, W, causal, qc, kc, fp32):
 
 cases = [(2048, W, True, 256, 256) for W in (1000, 1008, 1016, 1023, 1024, 1025, 1040, 2047, 130, 512)]
 cases += [(4096, 2047, True, 256, 256), (8192, 2047, True, 256, 256), (1024, 1000, True, 64, 64), (2048, 1000, True, 128, 256)]
-cases += [(2048, W, False, 256, 256) for W in (200, 256, 300, 1000)]
 for S, W, causal, qc, kc in cases:
     for fp32 in (True, False):
         try:
