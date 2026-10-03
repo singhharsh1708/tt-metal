@@ -9,10 +9,15 @@ echo "cpus $(nproc)  disk free $(df -h /home/user | tail -1 | awk '{print $4}') 
 FREE_GB=$(df -BG /home/user | tail -1 | awk '{print $4}' | tr -d G)
 if [ "$FREE_GB" -lt 60 ]; then echo "only ${FREE_GB}G free; a second tree plus build needs ~60G. Free space first."; exit 1; fi
 
-if [ ! -d "$D/.git" ]; then git clone -q --filter=blob:none https://github.com/tenstorrent/tt-metal.git "$D" || exit 1; fi
+echo "start $(date -u +%H:%M)"; if [ ! -d "$D/.git" ]; then git clone -q --filter=blob:none https://github.com/tenstorrent/tt-metal.git "$D" || exit 1; fi
 cd "$D" || exit 1
 git fetch -q origin main && git checkout -q --detach 4502c6d9c57 || exit 1
-git submodule update --init --recursive -q || { echo "submodule update failed"; exit 1; }
+git submodule sync -q --recursive
+if ! git submodule update --init --recursive -q; then
+  echo "submodule update failed once; de-initialising and retrying from scratch"
+  git submodule deinit -f --all -q; rm -rf .git/modules
+  git submodule update --init --recursive -q || { echo "submodule update failed"; git submodule status | head; exit 1; }
+fi
 echo "main at $(git log -1 --format='%h %cd %s' --date=short | cut -c1-90)"
 
 export TT_METAL_HOME=$D TT_METAL_RUNTIME_ROOT=$D PYTHONPATH=$D:$D/ttnn
