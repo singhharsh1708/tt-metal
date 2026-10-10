@@ -23,7 +23,7 @@ cfg = ("        // 32-bit inputs need a 32-bit DEST and unpack-to-DEST, or the u
        "                               input_cb_data_format == tt::DataFormat::UInt32;\n"
        "        metal2::ComputeHardwareConfig compute_cfg{.enable_32_bit_dest = is_32_bit};\n"
        "        if (is_32_bit) {\n"
-       "            compute_cfg.unpack_modes.insert({SRC0, metal2::UnpackMode::UnpackToDest});\n"
+       "            compute_cfg.unpack_modes.insert({SRC0, UnpackMode::UnpackToDest});\n"
        "        }\n")
 edit(f"{B}/upsample/device/upsample_program_factory_multicore_interleaved.cpp",
      [(anchor, anchor + cfg, 1),
