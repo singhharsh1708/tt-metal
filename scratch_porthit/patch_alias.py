@@ -8,7 +8,7 @@ helper = '''    // Which tensor arguments are the same tensor object: for each T
         std::vector<const void*> seen;
         std::vector<uint32_t> signature;
         const auto visit = [&](const ttnn::Tensor& t) {
-            const void* id = t.storage_type() == tt::tt_metal::StorageType::DEVICE
+            const void* id = t.storage_type() == StorageType::DEVICE
                                  ? static_cast<const void*>(&t.mesh_tensor())
                                  : nullptr;
             uint32_t first = static_cast<uint32_t>(seen.size());
