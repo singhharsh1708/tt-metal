@@ -20,6 +20,7 @@ grep -c "tt_memmove" $K
 tiny memmove
 cp $K "$RUN/kernel_before_v2.cpp"
 python $R/patch_concat_v2.py || { echo "PATCH FAILED"; exit 1; }
+ninja -C build > "$RUN/build.log" 2>&1 && cmake --install build > "$RUN/install.log" 2>&1; echo "=== build+install rc=$?"
 tiny copyloop
 pt () { command -v tt-smi >/dev/null && tt-smi -r 0 >/dev/null 2>&1; sleep 3; timeout -k 20 "$2" pytest -q -p no:cacheprovider -p no:timeout "${@:3}" > "$RUN/$1.log" 2>&1; rc=$?; echo "===== [$1] rc=$rc | $(grep -aE '(passed|failed|error).* in [0-9.]+s' "$RUN/$1.log" | tail -1 | cut -c1-120)"; grep -aE "^(FAILED|ERROR) " "$RUN/$1.log" | head -5 | cut -c1-200; }
 command -v tt-smi >/dev/null && tt-smi -r 0 >/dev/null 2>&1; sleep 3
